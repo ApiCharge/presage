@@ -11,3 +11,4 @@
 
 # VSCode debugger config
 .vscode/launch.json
+/.vs

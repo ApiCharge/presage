@@ -600,6 +600,9 @@ impl<S: Store> Manager<S, Registered> {
                 loop {
                     match state.encrypted_messages.next().await {
                         Some(Ok(Incoming::Envelope(envelope))) => {
+                            // Capture raw content bytes before open_envelope consumes the envelope.
+                            // These are the sealed sender wire format bytes needed for on-chain verification.
+                            let raw_content = envelope.content.as_ref().map(|c| c.to_vec());
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
                                 match ServiceId::parse_from_service_id_string(
@@ -864,7 +867,7 @@ impl<S: Store> Manager<S, Registered> {
                                         error!(%error, "error saving message to store");
                                     }
 
-                                    return Some((Received::Content(Box::new(content)), state));
+                                    return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone() }, state));
                                 }
                                 Ok(None) => {
                                     debug!("empty envelope, message will be skipped!")

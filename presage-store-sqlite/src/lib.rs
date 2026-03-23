@@ -25,7 +25,7 @@ use crate::error::SqlxErrorExt;
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
-    pub(crate) db: SqlitePool,
+    pub db: SqlitePool,
     pub(crate) trust_new_identities: OnNewIdentity,
 }
 

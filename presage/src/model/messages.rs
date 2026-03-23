@@ -10,6 +10,11 @@ pub enum Received {
     /// Contacts can be later queried in the store.
     Contacts,
 
-    /// Incoming decrypted message with metadata and content
-    Content(Box<Content>),
+    /// Incoming decrypted message with metadata, content, and raw envelope bytes.
+    /// `raw_content` contains the original encrypted envelope content before
+    /// decryption — the sealed sender wire format for on-chain verification.
+    Content {
+        content: Box<Content>,
+        raw_content: Option<Vec<u8>>,
+    },
 }

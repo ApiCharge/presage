@@ -594,7 +594,7 @@ async fn receive<S: Store>(
                 }
             }
             Received::Contacts => println!("got contacts synchronization"),
-            Received::Content(content) => {
+            Received::Content { content, .. } => {
                 process_incoming_message(
                     &mut manager,
                     attachments_tmp_dir.path(),
@@ -915,7 +915,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 match content {
                     Received::QueueEmpty => break,
                     Received::Contacts => println!("got contacts! thank you, come again."),
-                    Received::Content(_) => print!("."),
+                    Received::Content { .. } => print!("."),
                 }
             }
         }

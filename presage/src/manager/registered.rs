@@ -1850,7 +1850,7 @@ async fn set_account_attributes<S: Store>(
             name,
             registration_lock: None,
             unidentified_access_key: Some(data.profile_key.derive_access_key().to_vec()),
-            unrestricted_unidentified_access: false,
+            unrestricted_unidentified_access: true,
             capabilities: DeviceCapabilities::default(),
             discoverable_by_phone_number: true,
             pin: None,

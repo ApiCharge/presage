@@ -18,7 +18,6 @@ mod error;
 mod protocol;
 
 pub use error::SqliteStoreError;
-pub use protocol::LAST_LOADED_SESSION;
 pub use presage::model::identity::OnNewIdentity;
 pub use sqlx::sqlite::SqliteConnectOptions;
 

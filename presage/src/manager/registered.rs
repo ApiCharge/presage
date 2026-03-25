@@ -868,7 +868,7 @@ impl<S: Store> Manager<S, Registered> {
                                     }
 
                                     // Capture the session record that was loaded during open_envelope
-                                    let session_record_bytes = presage_store_sqlite::LAST_LOADED_SESSION.with(|cell| cell.borrow().clone());
+                                    let session_record_bytes = crate::LAST_LOADED_SESSION.with(|cell| cell.borrow().clone());
                                     return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), session_record_bytes }, state));
                                 }
                                 Ok(None) => {

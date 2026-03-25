@@ -868,7 +868,7 @@ impl<S: Store> Manager<S, Registered> {
                                     }
 
                                     // Capture message key from libsignal's decryption (set during open_envelope)
-                                    let message_key = libsignal_service::protocol::LAST_MESSAGE_KEY.with(|cell| cell.borrow_mut().take());
+                                    let message_key = libsignal_protocol::LAST_MESSAGE_KEY.with(|cell| cell.borrow_mut().take());
                                     return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), message_key }, state));
                                 }
                                 Ok(None) => {

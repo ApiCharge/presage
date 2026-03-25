@@ -12,5 +12,18 @@ libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rus
 # libsignal-service = { path = "../libsignal-service-rs" }
 
 # ApiCharge fork of libsignal — adds LAST_MESSAGE_KEY thread-local for sealed sender relay
+# All crates from the monorepo must be patched to avoid dual-version conflicts
 [patch."https://github.com/signalapp/libsignal"]
 libsignal-protocol = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+libsignal-core = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+libsignal-net = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+libsignal-net-infra = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+signal-crypto = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+zkgroup = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+zkcredential = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+poksho = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+attest = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+libsignal-account-keys = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+libsignal-keytrans = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+libsignal-svrb = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }
+usernames = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }

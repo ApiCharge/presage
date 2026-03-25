@@ -13,4 +13,4 @@ libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rus
 
 # ApiCharge fork of libsignal — adds LAST_MESSAGE_KEY thread-local for sealed sender relay
 [patch."https://github.com/signalapp/libsignal"]
-libsignal-protocol = { git = "https://github.com/ApiCharge/libsignal", branch = "main" }
+libsignal-protocol = { git = "https://github.com/ApiCharge/libsignal", branch = "apicharge-v0.87.4" }

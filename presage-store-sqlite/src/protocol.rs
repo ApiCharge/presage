@@ -19,7 +19,15 @@ use presage::{
 use sqlx::{query, query_scalar};
 use tracing::warn;
 
+use std::cell::RefCell;
+
 use crate::{SqliteStore, SqliteStoreError, error::SqlxErrorExt};
+
+// Thread-local capture of the last loaded session record (serialized bytes).
+// Used by the daemon to derive the Double Ratchet message_key before the ratchet advances.
+thread_local! {
+    pub static LAST_LOADED_SESSION: RefCell<Option<Vec<u8>>> = RefCell::new(None);
+}
 
 #[derive(Clone)]
 pub struct SqliteProtocolStore {
@@ -64,7 +72,13 @@ impl SessionStore for SqliteProtocolStore {
         .fetch_optional(&self.store.db)
         .await
         .into_protocol_error()?
-        .map(|record| SessionRecord::deserialize(&record.record))
+        .map(|record| {
+            // Capture raw session bytes before deserialization for message_key derivation
+            LAST_LOADED_SESSION.with(|cell| {
+                *cell.borrow_mut() = Some(record.record.clone());
+            });
+            SessionRecord::deserialize(&record.record)
+        })
         .transpose()
     }
 

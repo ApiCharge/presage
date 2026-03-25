@@ -16,5 +16,8 @@ pub enum Received {
     Content {
         content: Box<Content>,
         raw_content: Option<Vec<u8>>,
+        /// Raw session record bytes captured during open_envelope (via thread-local in session store).
+        /// The daemon parses these to extract the receiver chain_key for message_key derivation.
+        session_record_bytes: Option<Vec<u8>>,
     },
 }

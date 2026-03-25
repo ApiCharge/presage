@@ -867,7 +867,9 @@ impl<S: Store> Manager<S, Registered> {
                                         error!(%error, "error saving message to store");
                                     }
 
-                                    return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone() }, state));
+                                    // Capture the session record that was loaded during open_envelope
+                                    let session_record_bytes = presage_store_sqlite::LAST_LOADED_SESSION.with(|cell| cell.borrow().clone());
+                                    return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), session_record_bytes }, state));
                                 }
                                 Ok(None) => {
                                     debug!("empty envelope, message will be skipped!")

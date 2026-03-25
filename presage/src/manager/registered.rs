@@ -867,9 +867,9 @@ impl<S: Store> Manager<S, Registered> {
                                         error!(%error, "error saving message to store");
                                     }
 
-                                    // Capture the session record that was loaded during open_envelope
-                                    let session_record_bytes = crate::LAST_LOADED_SESSION.with(|cell| cell.borrow().clone());
-                                    return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), session_record_bytes }, state));
+                                    // Capture message key from libsignal's decryption (set during open_envelope)
+                                    let message_key = libsignal_service::protocol::LAST_MESSAGE_KEY.with(|cell| cell.borrow_mut().take());
+                                    return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), message_key }, state));
                                 }
                                 Ok(None) => {
                                     debug!("empty envelope, message will be skipped!")

@@ -64,13 +64,7 @@ impl SessionStore for SqliteProtocolStore {
         .fetch_optional(&self.store.db)
         .await
         .into_protocol_error()?
-        .map(|record| {
-            // Capture raw session bytes for message_key derivation
-            presage::LAST_LOADED_SESSION.with(|cell| {
-                *cell.borrow_mut() = Some(record.record.clone());
-            });
-            SessionRecord::deserialize(&record.record)
-        })
+        .map(|record| SessionRecord::deserialize(&record.record))
         .transpose()
     }
 

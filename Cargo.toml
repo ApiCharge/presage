@@ -10,3 +10,7 @@ libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rus
 # Uncomment if you're working with a local checkout of libsignal-service, but DO NOT commit!
 # [patch."https://github.com/whisperfish/libsignal-service-rs.git"]
 # libsignal-service = { path = "../libsignal-service-rs" }
+
+# ApiCharge fork of libsignal — adds LAST_MESSAGE_KEY thread-local for sealed sender relay
+[patch."https://github.com/signalapp/libsignal"]
+libsignal-protocol = { git = "https://github.com/ApiCharge/libsignal", branch = "main" }

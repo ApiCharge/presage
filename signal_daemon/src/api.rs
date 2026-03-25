@@ -27,7 +27,7 @@ pub struct ReceivedMessage {
     pub decrypted_body: Option<String>,
 }
 
-/// The five fields needed by the Soroban contract's SealedEnvelope.
+/// The fields needed by the Soroban contract's SealedEnvelope.
 /// All byte arrays are hex-encoded for JSON transport.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SealedEnvelopeDto {
@@ -35,7 +35,8 @@ pub struct SealedEnvelopeDto {
     pub s_mac_key: String,     // hex, 32 bytes
     pub s_ciphertext: String,  // hex, variable
     pub s_mac: String,         // hex, 32 bytes
-    pub message_key: String,   // hex, 32 bytes
+    pub message_key: String,   // hex, 32 bytes (Double Ratchet seed)
+    pub pqr_salt: String,      // hex, 32 bytes (PQR HKDF salt, or empty if inactive)
 }
 
 /// Response to GET /receive

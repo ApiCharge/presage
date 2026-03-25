@@ -44,7 +44,7 @@ pub async fn run_receive_loop(
             received = messages.next() => {
                 let Some(received) = received else { break };
                 match received {
-                    Received::Content { content, raw_content, message_key } => {
+                    Received::Content { content, raw_content, message_key, pqr_salt } => {
                         let body = extract_body_text(&content);
                         let sender_uuid = content.metadata.sender.raw_uuid().to_string();
                         let was_sealed = content.metadata.unidentified_sender;
@@ -59,13 +59,15 @@ pub async fn run_receive_loop(
                                         sender_identity_hex = Some(hex::encode(result.sender_identity_public));
 
                                         if let Some(ref mk) = message_key {
-                                            tracing::info!("Got message_key from libsignal ({} bytes)", mk.len());
+                                            let pqr_hex = pqr_salt.as_ref().map(|s| hex::encode(s)).unwrap_or_default();
+                                            tracing::info!("Got message_key ({} bytes), pqr_salt={}", mk.len(), if pqr_hex.is_empty() { "none" } else { &pqr_hex[..8] });
                                             sealed_dto = Some(SealedEnvelopeDto {
                                                 s_cipher_key: hex::encode(result.envelope.s_cipher_key),
                                                 s_mac_key: hex::encode(result.envelope.s_mac_key),
                                                 s_ciphertext: hex::encode(&result.envelope.s_ciphertext),
                                                 s_mac: hex::encode(result.envelope.s_mac),
                                                 message_key: hex::encode(mk),
+                                                pqr_salt: pqr_hex,
                                             });
                                         } else {
                                             tracing::warn!("No message_key captured from libsignal");

@@ -16,8 +16,10 @@ pub enum Received {
     Content {
         content: Box<Content>,
         raw_content: Option<Vec<u8>>,
-        /// Raw Double Ratchet message key (32 bytes) captured during open_envelope.
-        /// Used by the daemon for on-chain WhisperMessage MAC verification.
+        /// Raw Double Ratchet message key seed (32 bytes) captured during open_envelope.
         message_key: Option<Vec<u8>>,
+        /// PQR (post-quantum ratchet) salt for HKDF expansion of message_key.
+        /// None if PQR is not active (use zero salt).
+        pqr_salt: Option<Vec<u8>>,
     },
 }

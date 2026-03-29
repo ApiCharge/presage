@@ -124,11 +124,13 @@ async fn run_tls_poll_loop(
                             );
 
                             // Construct libsignal Envelope for presage decryption
+                            let our_uuid = manager.registration_data().service_ids.aci.to_string();
                             let envelope = presage::libsignal_service::envelope::Envelope {
                                 r#type: Some(6), // UNIDENTIFIED_SENDER
                                 content: Some(parsed_env.content.clone()),
                                 timestamp: Some(parsed_env.timestamp),
                                 server_timestamp: Some(parsed_env.server_timestamp),
+                                destination_service_id: Some(our_uuid),
                                 ..Default::default()
                             };
 

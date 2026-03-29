@@ -97,6 +97,14 @@ async fn run_tls_poll_loop(
                             s.pending_tls_session = Some(session_setup);
                         }
 
+                        // Log HTTP status for diagnostics
+                        let status = tls_response.response_body
+                            .split(|&b| b == b'\r')
+                            .next()
+                            .map(|l| String::from_utf8_lossy(l).to_string())
+                            .unwrap_or_default();
+                        tracing::info!("TLS poll: {}", status);
+
                         // Parse envelopes from the HTTP response
                         let parsed = parse_envelopes_from_protobuf(&tls_response.response_body);
                         tracing::info!("TLS poll: parsed {} envelope(s)", parsed.len());

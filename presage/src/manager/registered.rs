@@ -1361,6 +1361,32 @@ impl<S: Store> Manager<S, Registered> {
         ))
     }
 
+    /// Decrypt a single envelope outside the WebSocket receive stream.
+    ///
+    /// Used by the HTTP TLS polling path where envelopes arrive via REST
+    /// instead of the WebSocket MessagePipe. Runs the full libsignal decryption
+    /// pipeline (sealed sender → Double Ratchet) and captures the message key
+    /// and PQR salt via thread-locals set during decryption.
+    ///
+    /// Safe to call while `receive_messages()` stream is live — that stream
+    /// cloned the store and cipher into its own state, so `self` is free.
+    pub async fn decrypt_envelope(
+        &mut self,
+        envelope: libsignal_service::envelope::Envelope,
+    ) -> Result<Option<(Content, Option<Vec<u8>>, Option<Vec<u8>>)>, Error<S::Error>> {
+        let mut cipher = self.new_service_cipher_aci();
+        let content = cipher
+            .open_envelope(envelope, &mut rng())
+            .await
+            .map_err(Error::ServiceError)?;
+
+        let message_key =
+            libsignal_protocol::LAST_MESSAGE_KEY.with(|cell| cell.borrow_mut().take());
+        let pqr_salt = libsignal_protocol::LAST_PQR_SALT.with(|cell| cell.borrow_mut().take());
+
+        Ok(content.map(|c| (c, message_key, pqr_salt)))
+    }
+
     fn new_service_cipher_aci(&self) -> ServiceCipher<S::AciStore> {
         ServiceCipher::new(
             self.store.aci_protocol_store(),

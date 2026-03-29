@@ -60,10 +60,19 @@ pub struct SealedEnvelopeFields {
     pub s_mac: [u8; 32],
 }
 
+/// Raw ECDH shared secrets for TLS-verified flow.
+/// The contract verifies these via TLS-anchored MAC comparison.
+#[derive(Debug, Clone)]
+pub struct EcdhSharedSecrets {
+    pub e_shared: [u8; 32],
+    pub s_shared: [u8; 32],
+}
+
 /// Full extraction result.
 #[derive(Debug, Clone)]
 pub struct ExtractionResult {
     pub envelope: SealedEnvelopeFields,
+    pub ecdh: EcdhSharedSecrets,
     pub s_plaintext: Vec<u8>,
     pub sender_identity_public: [u8; 32],
 }
@@ -195,6 +204,7 @@ pub fn extract_sealed_sender(
             s_ciphertext: s_ciphertext_bytes.to_vec(),
             s_mac: s_mac_full,
         },
+        ecdh: EcdhSharedSecrets { e_shared, s_shared },
         s_plaintext,
         sender_identity_public,
     })

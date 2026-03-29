@@ -20,8 +20,11 @@ pub struct ReceivedMessage {
     /// Unix timestamp (milliseconds)
     pub timestamp: u64,
 
-    /// Sealed sender material for the Soroban contract
+    /// Legacy sealed sender material for the old contract flow
     pub sealed_envelope: SealedEnvelopeDto,
+
+    /// TLS-verified envelope material for the new contract flow
+    pub verified_envelope: Option<VerifiedEnvelopeDto>,
 
     /// Decrypted message body (for relay to display/respond)
     pub decrypted_body: Option<String>,
@@ -37,6 +40,31 @@ pub struct SealedEnvelopeDto {
     pub s_mac: String,         // hex, 32 bytes
     pub message_key: String,   // hex, 32 bytes (Double Ratchet seed)
     pub pqr_salt: String,      // hex, 32 bytes (PQR HKDF salt, or empty if inactive)
+}
+
+/// TLS-verified envelope fields for the new contract flow.
+/// The contract independently verifies the TLS record, then uses
+/// the ECDH shared secrets (pinned by TLS-anchored MACs) to decrypt.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct VerifiedEnvelopeDto {
+    pub session_id: u64,
+    pub tls_record: String,       // hex, raw TLS record
+    pub tls_sequence_no: u64,
+    pub e_shared: String,         // hex, 32 bytes
+    pub s_shared: String,         // hex, 32 bytes
+    pub message_key: String,      // hex, 32 bytes
+    pub pqr_salt: String,         // hex, 32 bytes
+}
+
+/// TLS session setup data sent once per new TLS connection.
+/// The contract verifies the handshake to anchor the session keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsSessionSetupDto {
+    pub session_id: u64,
+    pub client_hello: String,           // hex, plaintext ClientHello
+    pub server_hello: String,           // hex, plaintext ServerHello
+    pub encrypted_handshake: String,    // hex, encrypted HS records
+    pub client_ephemeral_priv: String,  // hex, 32 bytes (single-use, safe to reveal)
 }
 
 /// Response to GET /receive

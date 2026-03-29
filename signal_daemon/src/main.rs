@@ -15,8 +15,10 @@
 
 mod api;
 mod config;
+mod message_keys;
 mod receiver;
 mod sealed_sender;
+mod tls_poll;
 
 use api::*;
 use std::sync::Arc;
@@ -41,6 +43,8 @@ pub struct AppState {
     pub connected: bool,
     pub phone_number: String,
     pub uuid: String,
+    /// TLS session setup for the relay to submit to the contract (once per TLS session)
+    pub pending_tls_session: Option<api::TlsSessionSetupDto>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -95,12 +99,24 @@ async fn async_main() -> anyhow::Result<()> {
         connected: false,
         phone_number: daemon_config.phone_number.clone(),
         uuid: daemon_config.uuid.clone(),
+        pending_tls_session: None,
     }));
+
+    // Create TLS polling client if SIGNAL_HOST is set
+    let tls_client = std::env::var("SIGNAL_HOST").ok().map(|host| {
+        tracing::info!("TLS polling enabled for {host}");
+        std::sync::Arc::new(tls_poll::TlsPollClient::new(
+            &host,
+            &daemon_config.uuid,
+            &daemon_config.password,
+        ))
+    });
 
     // Run the receiver on a dedicated OS thread (presage futures are huge in debug)
     let recv_state = state.clone();
     let recv_db = db_path.clone();
     let recv_config = daemon_config.clone();
+    let recv_tls = tls_client.clone();
     std::thread::Builder::new()
         .name("presage-receiver".into())
         .stack_size(16 * 1024 * 1024)
@@ -129,7 +145,7 @@ async fn async_main() -> anyhow::Result<()> {
 
                 loop {
                     let queue = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                    match receiver::run_receive_loop(&mut manager, queue.clone(), &recv_config, recv_state.clone()).await {
+                    match receiver::run_receive_loop(&mut manager, queue.clone(), &recv_config, recv_state.clone(), recv_tls.clone()).await {
                         Ok(()) => tracing::info!("Receiver ended, reconnecting in 10s..."),
                         Err(e) => tracing::error!("Receiver error: {e:#}, reconnecting in 10s..."),
                     }
@@ -151,6 +167,7 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/receive", get(handle_receive))
         .route("/send", post(handle_send))
         .route("/status", get(handle_status))
+        .route("/tls-session", get(handle_tls_session))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -192,6 +209,13 @@ async fn handle_status(State(state): State<SharedState>) -> Json<StatusResponse>
         uuid: s.uuid.clone(),
         messages_received: s.messages_received,
     })
+}
+
+/// GET /tls-session — retrieve the latest TLS session setup data.
+/// The .NET relay calls this once per TLS session, then submits to the contract's verify_tls_session.
+async fn handle_tls_session(State(state): State<SharedState>) -> Json<Option<api::TlsSessionSetupDto>> {
+    let mut s = state.lock().await;
+    Json(s.pending_tls_session.take())
 }
 
 /// Create a presage-compatible SQLite store from signal-cli credentials.

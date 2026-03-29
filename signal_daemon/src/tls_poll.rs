@@ -342,6 +342,8 @@ impl TlsPollClient {
 
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Signal uses a self-signed CA, not a public CA. Add Signal's root cert.
+        add_signal_root_ca(&mut root_store);
 
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()
@@ -496,6 +498,7 @@ impl TlsPollClient {
 
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        add_signal_root_ca(&mut root_store);
 
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -551,4 +554,15 @@ impl TlsPollClient {
     pub fn password(&self) -> &str {
         &self.password
     }
+}
+
+/// Add Signal's self-signed root CA to the trust store.
+/// Signal Messenger uses its own CA (not a public CA like Let's Encrypt).
+/// Root cert: C=US, ST=California, L=Mountain View, O=Signal Messenger, LLC, CN=Signal Messenger
+/// Valid: 2022-01-26 to 2032-01-24 (RSA 4096-bit, self-signed)
+fn add_signal_root_ca(root_store: &mut rustls::RootCertStore) {
+    const SIGNAL_ROOT_CA_DER: &[u8] = &include_bytes!("signal_root_ca.der")[..];
+    root_store
+        .add(rustls::pki_types::CertificateDer::from(SIGNAL_ROOT_CA_DER))
+        .expect("Signal root CA is valid");
 }

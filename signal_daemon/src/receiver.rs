@@ -1,7 +1,8 @@
 //! Message receiver with sealed sender extraction + send processing.
-//! Supports two parallel paths:
-//!   1. WebSocket (via presage) — for message sends and backward-compatible reception
-//!   2. HTTP polling (via tls_poll) — for TLS-verified message reception
+//!
+//! When TLS polling is enabled (SIGNAL_HOST set), HTTP polling is the ONLY
+//! receive path. The WebSocket is NOT used for receiving — only for sends.
+//! When TLS polling is disabled, falls back to WebSocket reception.
 
 use crate::api::{ReceivedMessage, SealedEnvelopeDto, VerifiedEnvelopeDto};
 use crate::config::DaemonConfig;
@@ -30,9 +31,12 @@ pub async fn create_manager(
     Ok(manager)
 }
 
-/// Main receive loop with dual-mode reception:
-/// - WebSocket for sends and backward-compatible message reception
-/// - HTTP polling for TLS-verified message reception (new flow)
+/// Main receive loop. Two modes:
+///
+/// **TLS polling mode** (SIGNAL_HOST set): HTTP poll is the ONLY receive path.
+/// No WebSocket receive stream. Manager is used only for sends and decrypt_envelope.
+///
+/// **Legacy mode** (no SIGNAL_HOST): WebSocket via presage receive_messages().
 pub async fn run_receive_loop(
     manager: &mut Manager<SqliteStore, presage::manager::Registered>,
     message_queue: Arc<Mutex<Vec<ReceivedMessage>>>,
@@ -40,98 +44,37 @@ pub async fn run_receive_loop(
     app_state: Arc<Mutex<crate::AppState>>,
     tls_client: Option<Arc<TlsPollClient>>,
 ) -> anyhow::Result<()> {
-    tracing::info!("Starting receive loop...");
+    if tls_client.is_some() {
+        run_tls_poll_loop(manager, config, app_state, tls_client.unwrap()).await
+    } else {
+        run_websocket_loop(manager, message_queue, config, app_state).await
+    }
+}
 
-    let messages = manager.receive_messages().await?;
-    futures::pin_mut!(messages);
+/// TLS polling mode: HTTP poll only, no WebSocket receive.
+async fn run_tls_poll_loop(
+    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
+    config: &DaemonConfig,
+    app_state: Arc<Mutex<crate::AppState>>,
+    tls_client: Arc<TlsPollClient>,
+) -> anyhow::Result<()> {
+    tracing::info!("Starting TLS poll receive loop (HTTP only, no WebSocket receive)");
 
     let mut send_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3));
 
     loop {
         tokio::select! {
-            // ---- WebSocket path: presage message stream ----
-            received = messages.next() => {
-                let Some(received) = received else { break };
-                match received {
-                    Received::Content { content, raw_content, message_key, pqr_salt } => {
-                        let body = extract_body_text(&content);
-                        let sender_uuid = content.metadata.sender.raw_uuid().to_string();
-                        let was_sealed = content.metadata.unidentified_sender;
-
-                        let mut sealed_dto = None;
-                        let mut sender_identity_hex = None;
-
-                        if was_sealed {
-                            if let Some(raw) = raw_content.as_deref() {
-                                match sealed_sender::extract_sealed_sender(raw, &config.identity_private_key, &config.identity_public_key) {
-                                    Ok(result) => {
-                                        sender_identity_hex = Some(hex::encode(result.sender_identity_public));
-
-                                        if let Some(ref mk) = message_key {
-                                            let pqr_hex = pqr_salt.as_ref().map(|s| hex::encode(s)).unwrap_or_default();
-                                            tracing::info!("Got message_key ({} bytes), pqr_salt={}", mk.len(), if pqr_hex.is_empty() { "none" } else { &pqr_hex[..8] });
-                                            sealed_dto = Some(SealedEnvelopeDto {
-                                                s_cipher_key: hex::encode(result.envelope.s_cipher_key),
-                                                s_mac_key: hex::encode(result.envelope.s_mac_key),
-                                                s_ciphertext: hex::encode(&result.envelope.s_ciphertext),
-                                                s_mac: hex::encode(result.envelope.s_mac),
-                                                message_key: hex::encode(mk),
-                                                pqr_salt: pqr_hex,
-                                            });
-                                        } else {
-                                            tracing::warn!("No message_key captured from libsignal");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Sealed sender extraction failed: {e:#}");
-                                    }
-                                }
-                            }
-                        }
-
-                        tracing::info!(
-                            "Message from {}: {} [sealed={}]",
-                            sender_uuid,
-                            body.as_deref().unwrap_or("<non-text>"),
-                            sealed_dto.is_some(),
-                        );
-
-                        let msg = ReceivedMessage {
-                            sender_uuid,
-                            sender_phone: None,
-                            sender_identity_key: sender_identity_hex,
-                            timestamp: content.metadata.timestamp,
-                            sealed_envelope: sealed_dto.unwrap_or_default(),
-                            verified_envelope: None,
-                            decrypted_body: body,
-                        };
-
-                        message_queue.lock().await.push(msg.clone());
-                        {
-                            let mut s = app_state.lock().await;
-                            s.message_queue.push(msg);
-                            s.messages_received += 1;
-                        }
-                    }
-                    Received::QueueEmpty => {
-                        tracing::debug!("Queue empty, waiting for messages...");
-                    }
-                    _ => {}
-                }
-            }
-
             // ---- Outbound sends (every 2s) ----
             _ = send_interval.tick() => {
                 process_pending_sends(manager, &app_state).await;
             }
 
-            // ---- TLS polling path (every 3s, if enabled) ----
-            _ = poll_interval.tick(), if tls_client.is_some() => {
-                let client = tls_client.as_ref().unwrap();
-                match client.poll_messages().await {
+            // ---- TLS polling: the ONLY receive path ----
+            _ = poll_interval.tick() => {
+                match tls_client.poll_messages().await {
                     Ok(Some(tls_response)) => {
-                        let session_id = client.current_session_id();
+                        let session_id = tls_client.current_session_id();
                         tracing::info!(
                             "TLS poll: got response ({} records, session {}, ch={}B, sh={}B, eph={})",
                             tls_response.message_records.len(),
@@ -154,7 +97,7 @@ pub async fn run_receive_loop(
                             s.pending_tls_session = Some(session_setup);
                         }
 
-                        // Parse envelopes from the protobuf HTTP response
+                        // Parse envelopes from the HTTP response
                         let parsed = parse_envelopes_from_protobuf(&tls_response.response_body);
                         tracing::info!("TLS poll: parsed {} envelope(s)", parsed.len());
 
@@ -248,15 +191,13 @@ pub async fn run_receive_loop(
                             }
                         }
 
-                        // Acknowledge all processed messages
-                        if !ack_guids.is_empty() {
-                            let guids_to_ack: Vec<_> = ack_guids.into_iter()
-                                .filter(|g| !g.is_empty())
-                                .collect();
-                            if !guids_to_ack.is_empty() {
-                                if let Err(e) = client.acknowledge_messages(&guids_to_ack).await {
-                                    tracing::warn!("TLS poll: ACK failed: {e:#}");
-                                }
+                        // Acknowledge processed messages
+                        let guids_to_ack: Vec<_> = ack_guids.into_iter()
+                            .filter(|g| !g.is_empty())
+                            .collect();
+                        if !guids_to_ack.is_empty() {
+                            if let Err(e) = tls_client.acknowledge_messages(&guids_to_ack).await {
+                                tracing::warn!("TLS poll: ACK failed: {e:#}");
                             }
                         }
                     }
@@ -267,6 +208,99 @@ pub async fn run_receive_loop(
                         tracing::warn!("TLS poll error: {e:#}");
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Legacy WebSocket mode: presage receive_messages() stream.
+async fn run_websocket_loop(
+    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
+    message_queue: Arc<Mutex<Vec<ReceivedMessage>>>,
+    config: &DaemonConfig,
+    app_state: Arc<Mutex<crate::AppState>>,
+) -> anyhow::Result<()> {
+    tracing::info!("Starting WebSocket receive loop (legacy mode)");
+
+    let messages = manager.receive_messages().await?;
+    futures::pin_mut!(messages);
+
+    let mut send_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+
+    loop {
+        tokio::select! {
+            received = messages.next() => {
+                let Some(received) = received else { break };
+                match received {
+                    Received::Content { content, raw_content, message_key, pqr_salt } => {
+                        let body = extract_body_text(&content);
+                        let sender_uuid = content.metadata.sender.raw_uuid().to_string();
+                        let was_sealed = content.metadata.unidentified_sender;
+
+                        let mut sealed_dto = None;
+                        let mut sender_identity_hex = None;
+
+                        if was_sealed {
+                            if let Some(raw) = raw_content.as_deref() {
+                                match sealed_sender::extract_sealed_sender(raw, &config.identity_private_key, &config.identity_public_key) {
+                                    Ok(result) => {
+                                        sender_identity_hex = Some(hex::encode(result.sender_identity_public));
+
+                                        if let Some(ref mk) = message_key {
+                                            let pqr_hex = pqr_salt.as_ref().map(|s| hex::encode(s)).unwrap_or_default();
+                                            tracing::info!("Got message_key ({} bytes), pqr_salt={}", mk.len(), if pqr_hex.is_empty() { "none" } else { &pqr_hex[..8] });
+                                            sealed_dto = Some(SealedEnvelopeDto {
+                                                s_cipher_key: hex::encode(result.envelope.s_cipher_key),
+                                                s_mac_key: hex::encode(result.envelope.s_mac_key),
+                                                s_ciphertext: hex::encode(&result.envelope.s_ciphertext),
+                                                s_mac: hex::encode(result.envelope.s_mac),
+                                                message_key: hex::encode(mk),
+                                                pqr_salt: pqr_hex,
+                                            });
+                                        } else {
+                                            tracing::warn!("No message_key captured from libsignal");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Sealed sender extraction failed: {e:#}");
+                                    }
+                                }
+                            }
+                        }
+
+                        tracing::info!(
+                            "Message from {}: {} [sealed={}]",
+                            sender_uuid,
+                            body.as_deref().unwrap_or("<non-text>"),
+                            sealed_dto.is_some(),
+                        );
+
+                        let msg = ReceivedMessage {
+                            sender_uuid,
+                            sender_phone: None,
+                            sender_identity_key: sender_identity_hex,
+                            timestamp: content.metadata.timestamp,
+                            sealed_envelope: sealed_dto.unwrap_or_default(),
+                            verified_envelope: None,
+                            decrypted_body: body,
+                        };
+
+                        message_queue.lock().await.push(msg.clone());
+                        {
+                            let mut s = app_state.lock().await;
+                            s.message_queue.push(msg);
+                            s.messages_received += 1;
+                        }
+                    }
+                    Received::QueueEmpty => {
+                        tracing::debug!("Queue empty, waiting for messages...");
+                    }
+                    _ => {}
+                }
+            }
+
+            _ = send_interval.tick() => {
+                process_pending_sends(manager, &app_state).await;
             }
         }
     }
@@ -315,7 +349,6 @@ async fn process_pending_sends(
 // Protobuf envelope parsing for Signal's GET /v1/messages response
 // ============================================================================
 
-/// Parsed envelope from Signal's protobuf response.
 pub struct ParsedEnvelope {
     pub content: Vec<u8>,
     pub timestamp: u64,
@@ -323,16 +356,12 @@ pub struct ParsedEnvelope {
     pub guid: String,
 }
 
-/// Parse envelopes from a protobuf-encoded HTTP response body.
-///
-/// Signal's GET /v1/messages (with Accept: application/x-protobuf) returns
-/// an IncomingMessageList protobuf. If the response is actually JSON
-/// (server ignores Accept header), falls back to JSON parsing.
+/// Parse envelopes from an HTTP response body.
+/// Tries protobuf first, falls back to JSON.
 fn parse_envelopes_from_protobuf(http_response: &[u8]) -> Vec<ParsedEnvelope> {
-    // Find HTTP body after \r\n\r\n
     let body = match find_http_body(http_response) {
         Some(b) => b,
-        None => http_response, // No HTTP headers, treat entire input as body
+        None => http_response,
     };
 
     if body.is_empty() {
@@ -341,10 +370,8 @@ fn parse_envelopes_from_protobuf(http_response: &[u8]) -> Vec<ParsedEnvelope> {
 
     // Try protobuf first, fall back to JSON
     if body.first() == Some(&0x0a) || body.first().map(|b| b & 0x07 == 2).unwrap_or(false) {
-        // Looks like protobuf (field 1, wire type 2 = LEN)
         parse_incoming_message_list_protobuf(body)
     } else if body.first() == Some(&b'{') || body.first() == Some(&b'[') {
-        // Looks like JSON
         parse_envelopes_json(body)
     } else {
         tracing::warn!("TLS poll: unknown response format (first byte: {:02x})", body.first().unwrap_or(&0));
@@ -352,7 +379,6 @@ fn parse_envelopes_from_protobuf(http_response: &[u8]) -> Vec<ParsedEnvelope> {
     }
 }
 
-/// Find the HTTP body after the header separator.
 fn find_http_body(data: &[u8]) -> Option<&[u8]> {
     for i in 0..data.len().saturating_sub(3) {
         if &data[i..i + 4] == b"\r\n\r\n" {
@@ -362,8 +388,6 @@ fn find_http_body(data: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Parse IncomingMessageList protobuf.
-/// Schema: field 1 (repeated LEN) = Envelope messages
 fn parse_incoming_message_list_protobuf(data: &[u8]) -> Vec<ParsedEnvelope> {
     let mut envelopes = Vec::new();
     let mut pos = 0;
@@ -372,7 +396,6 @@ fn parse_incoming_message_list_protobuf(data: &[u8]) -> Vec<ParsedEnvelope> {
         let Ok((field, wire_type)) = pb_read_tag(data, &mut pos) else { break };
         match (field, wire_type) {
             (1, 2) => {
-                // Envelope message (LEN-delimited)
                 let Ok(envelope_bytes) = pb_read_bytes(data, &mut pos) else { break };
                 if let Some(env) = parse_signal_envelope_protobuf(&envelope_bytes) {
                     envelopes.push(env);
@@ -389,15 +412,6 @@ fn parse_incoming_message_list_protobuf(data: &[u8]) -> Vec<ParsedEnvelope> {
     envelopes
 }
 
-/// Parse a single Signal Envelope protobuf.
-/// Key fields:
-///   field 1 (varint) = type
-///   field 5 (LEN)    = sourceServiceId
-///   field 7 (varint)  = sourceDevice
-///   field 8 (LEN)    = content (sealed sender bytes)
-///   field 10 (varint) = serverTimestamp
-///   field 13 (LEN)   = serverGuid (UUID string for ACK)
-///   field 14 (varint) = urgent
 fn parse_signal_envelope_protobuf(data: &[u8]) -> Option<ParsedEnvelope> {
     let mut pos = 0;
     let mut content: Option<Vec<u8>> = None;
@@ -409,67 +423,41 @@ fn parse_signal_envelope_protobuf(data: &[u8]) -> Option<ParsedEnvelope> {
     while pos < data.len() {
         let Ok((field, wire_type)) = pb_read_tag(data, &mut pos) else { break };
         match (field, wire_type) {
-            (1, 0) => {
-                r#type = pb_read_varint(data, &mut pos).unwrap_or(0) as u32;
-            }
-            (3, 0) => {
-                // timestamp
-                timestamp = pb_read_varint(data, &mut pos).unwrap_or(0);
-            }
-            (8, 2) => {
-                // content
-                content = pb_read_bytes(data, &mut pos).ok();
-            }
-            (10, 0) => {
-                // serverTimestamp
-                server_timestamp = pb_read_varint(data, &mut pos).unwrap_or(0);
-            }
+            (1, 0) => { r#type = pb_read_varint(data, &mut pos).unwrap_or(0) as u32; }
+            (3, 0) => { timestamp = pb_read_varint(data, &mut pos).unwrap_or(0); }
+            (8, 2) => { content = pb_read_bytes(data, &mut pos).ok(); }
+            (10, 0) => { server_timestamp = pb_read_varint(data, &mut pos).unwrap_or(0); }
             (13, 2) => {
-                // serverGuid (UUID string)
                 if let Ok(bytes) = pb_read_bytes(data, &mut pos) {
                     guid = String::from_utf8_lossy(&bytes).to_string();
                 }
             }
             (_, wt) => {
-                if pb_skip_field(data, &mut pos, wt).is_err() {
-                    break;
-                }
+                if pb_skip_field(data, &mut pos, wt).is_err() { break; }
             }
         }
     }
 
     let content = content?;
-    if content.is_empty() {
-        return None;
-    }
+    if content.is_empty() { return None; }
 
-    // Only process UNIDENTIFIED_SENDER (type 6)
     if r#type != 6 {
         tracing::debug!("Skipping non-sealed-sender envelope type {}", r#type);
         return None;
     }
 
-    if timestamp == 0 {
-        timestamp = server_timestamp;
-    }
+    if timestamp == 0 { timestamp = server_timestamp; }
 
-    Some(ParsedEnvelope {
-        content,
-        timestamp,
-        server_timestamp,
-        guid,
-    })
+    Some(ParsedEnvelope { content, timestamp, server_timestamp, guid })
 }
 
-/// JSON fallback parser for GET /v1/messages.
 fn parse_envelopes_json(body: &[u8]) -> Vec<ParsedEnvelope> {
     let body_str = match std::str::from_utf8(body) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
 
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(body_str);
-    let value = match parsed {
+    let value: serde_json::Value = match serde_json::from_str(body_str) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -482,9 +470,7 @@ fn parse_envelopes_json(body: &[u8]) -> Vec<ParsedEnvelope> {
     let mut envelopes = Vec::new();
     for msg in messages {
         let msg_type = msg.get("type").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
-        if msg_type != 6 {
-            continue;
-        }
+        if msg_type != 6 { continue; }
 
         let content_b64 = match msg.get("content").and_then(|c| c.as_str()) {
             Some(s) => s,
@@ -502,19 +488,14 @@ fn parse_envelopes_json(body: &[u8]) -> Vec<ParsedEnvelope> {
         let server_timestamp = msg.get("serverTimestamp").and_then(|t| t.as_u64()).unwrap_or(0);
         let guid = msg.get("guid").and_then(|g| g.as_str()).unwrap_or("").to_string();
 
-        envelopes.push(ParsedEnvelope {
-            content,
-            timestamp,
-            server_timestamp,
-            guid,
-        });
+        envelopes.push(ParsedEnvelope { content, timestamp, server_timestamp, guid });
     }
 
     envelopes
 }
 
 // ============================================================================
-// Minimal protobuf wire format helpers (same pattern as sealed_sender.rs)
+// Minimal protobuf wire format helpers
 // ============================================================================
 
 fn pb_read_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<u64> {
@@ -525,9 +506,7 @@ fn pb_read_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<u64> {
         let byte = data[*pos];
         *pos += 1;
         result |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(result);
-        }
+        if byte & 0x80 == 0 { return Ok(result); }
         shift += 7;
         anyhow::ensure!(shift < 64, "varint overflow");
     }
@@ -560,10 +539,6 @@ fn pb_skip_field(data: &[u8], pos: &mut usize, wire_type: u32) -> anyhow::Result
     }
     Ok(())
 }
-
-// ============================================================================
-// Helpers
-// ============================================================================
 
 fn extract_body_text(content: &Content) -> Option<String> {
     match &content.body {

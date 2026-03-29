@@ -103,9 +103,13 @@ fn build_capturing_provider(
         })
         .collect();
 
+    // Leak to get a &'static reference — one allocation per TLS connection, acceptable
+    let kx_group: &'static dyn rustls::crypto::SupportedKxGroup =
+        Box::leak(Box::new(CapturingX25519 { captured_priv }));
+
     rustls::crypto::CryptoProvider {
         cipher_suites,
-        kx_groups: vec![Arc::new(CapturingX25519 { captured_priv })],
+        kx_groups: vec![kx_group],
         signature_verification_algorithms: ring_provider.signature_verification_algorithms,
         secure_random: ring_provider.secure_random,
         key_provider: ring_provider.key_provider,
@@ -116,6 +120,7 @@ fn build_capturing_provider(
 // KeyLog for capturing SERVER_TRAFFIC_SECRET_0
 // ============================================================================
 
+#[derive(Debug)]
 struct KeyCapture {
     server_traffic_secret: Mutex<Option<Vec<u8>>>,
 }

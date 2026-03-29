@@ -432,7 +432,6 @@ impl TlsPollClient {
             "GET /v1/messages HTTP/1.1\r\n\
              Host: {}\r\n\
              Authorization: Basic {auth}\r\n\
-             Accept: application/x-protobuf\r\n\
              X-Signal-Receive-Stories: false\r\n\
              Connection: close\r\n\
              \r\n",

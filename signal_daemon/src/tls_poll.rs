@@ -561,8 +561,8 @@ impl TlsPollClient {
 /// Root cert: C=US, ST=California, L=Mountain View, O=Signal Messenger, LLC, CN=Signal Messenger
 /// Valid: 2022-01-26 to 2032-01-24 (RSA 4096-bit, self-signed)
 fn add_signal_root_ca(root_store: &mut rustls::RootCertStore) {
-    const SIGNAL_ROOT_CA_DER: &[u8] = &include_bytes!("signal_root_ca.der")[..];
+    let der = include_bytes!("signal_root_ca.der");
     root_store
-        .add(rustls::pki_types::CertificateDer::from(SIGNAL_ROOT_CA_DER))
+        .add(rustls::pki_types::CertificateDer::from(&der[..]))
         .expect("Signal root CA is valid");
 }

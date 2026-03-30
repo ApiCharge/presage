@@ -429,7 +429,7 @@ impl TlsPollClient {
             format!("{}:{}", self.uuid, self.password),
         );
         let request = format!(
-            "GET /v1/messages HTTP/1.1\r\n\
+            "GET /v1/messages/ HTTP/1.1\r\n\
              Host: {}\r\n\
              Authorization: Basic {auth}\r\n\
              X-Signal-Receive-Stories: false\r\n\

@@ -55,6 +55,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
+    // Install ring as the default CryptoProvider for presage's WebSocket connections
+    // (send_message, etc). Our TLS poll uses a custom provider per-connection.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

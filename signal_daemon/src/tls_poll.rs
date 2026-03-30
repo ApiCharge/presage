@@ -489,12 +489,30 @@ impl TlsPollClient {
     }
 
     /// Acknowledge messages by sending DELETE requests.
-    /// Uses a fresh (non-capturing) TLS connection.
+    /// Each DELETE uses its own TLS connection to avoid HTTP pipelining issues.
     pub async fn acknowledge_messages(&self, guids: &[String]) -> anyhow::Result<()> {
         if guids.is_empty() {
             return Ok(());
         }
 
+        let auth = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{}:{}", self.uuid, self.password),
+        );
+
+        let mut success = 0u32;
+        for guid in guids {
+            match self.send_delete(&auth, guid).await {
+                Ok(()) => success += 1,
+                Err(e) => tracing::warn!("ACK failed for {guid}: {e:#}"),
+            }
+        }
+
+        tracing::debug!("Acknowledged {success}/{} messages", guids.len());
+        Ok(())
+    }
+
+    async fn send_delete(&self, auth: &str, guid: &str) -> anyhow::Result<()> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         add_signal_root_ca(&mut root_store);
@@ -508,33 +526,29 @@ impl TlsPollClient {
         let tcp = TcpStream::connect(format!("{}:443", self.signal_host)).await?;
         let mut tls = connector.connect(server_name, tcp).await?;
 
-        let auth = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            format!("{}:{}", self.uuid, self.password),
+        let request = format!(
+            "DELETE /v1/messages/uuid/{guid} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Authorization: Basic {auth}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\
+             \r\n",
+            self.signal_host,
         );
+        tls.write_all(request.as_bytes()).await?;
+        tls.flush().await?;
 
-        for guid in guids {
-            let request = format!(
-                "DELETE /v1/messages/uuid/{guid} HTTP/1.1\r\n\
-                 Host: {}\r\n\
-                 Authorization: Basic {auth}\r\n\
-                 Content-Length: 0\r\n\
-                 \r\n",
-                self.signal_host,
-            );
-            tls.write_all(request.as_bytes()).await?;
-            tls.flush().await?;
+        // Read response to confirm
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await?;
+        let status = response.split(|&b| b == b'\r').next()
+            .map(|l| String::from_utf8_lossy(l).to_string())
+            .unwrap_or_default();
 
-            // Read response (we don't need the body, just drain it)
-            let mut buf = [0u8; 1024];
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tls.read(&mut buf),
-            )
-            .await;
+        if !status.contains("200") && !status.contains("204") {
+            anyhow::bail!("DELETE {guid}: {status}");
         }
 
-        tracing::debug!("Acknowledged {} messages", guids.len());
         Ok(())
     }
 

@@ -60,6 +60,10 @@ async fn run_tls_poll_loop(
 ) -> anyhow::Result<()> {
     tracing::info!("Starting TLS poll receive loop (HTTP only, no WebSocket receive)");
 
+    // Drain any stale messages from previous runs via WebSocket ACK
+    tracing::info!("Draining stale message queue on startup...");
+    drain_websocket_queue(manager).await;
+
     let mut send_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3));
 
@@ -201,14 +205,11 @@ async fn run_tls_poll_loop(
                             }
                         }
 
-                        // Acknowledge processed messages
-                        let guids_to_ack: Vec<_> = ack_guids.into_iter()
-                            .filter(|g| !g.is_empty())
-                            .collect();
-                        if !guids_to_ack.is_empty() {
-                            if let Err(e) = tls_client.acknowledge_messages(&guids_to_ack).await {
-                                tracing::warn!("TLS poll: ACK failed: {e:#}");
-                            }
+                        // ACK messages by briefly opening a WebSocket.
+                        // Signal only ACKs via WS response frames — REST DELETE doesn't exist.
+                        // receive_messages() auto-ACKs on receive; drain until QueueEmpty.
+                        if !parsed.is_empty() {
+                            drain_websocket_queue(manager).await;
                         }
                     }
                     Ok(None) => {
@@ -316,6 +317,41 @@ async fn run_websocket_loop(
     }
 
     Ok(())
+}
+
+/// Briefly open a WebSocket to drain and ACK all pending messages.
+/// Signal only removes messages from the queue via WebSocket ACK frames.
+/// We don't process the content — just let presage auto-ACK everything.
+async fn drain_websocket_queue(
+    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
+) {
+    tracing::debug!("Draining message queue via WebSocket ACK...");
+    match manager.receive_messages().await {
+        Ok(stream) => {
+            futures::pin_mut!(stream);
+            let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
+            tokio::pin!(timeout);
+            let mut count = 0u32;
+            loop {
+                tokio::select! {
+                    item = stream.next() => {
+                        match item {
+                            Some(Received::QueueEmpty) | None => break,
+                            Some(_) => { count += 1; }
+                        }
+                    }
+                    _ = &mut timeout => {
+                        tracing::debug!("WS drain timeout after {count} messages");
+                        break;
+                    }
+                }
+            }
+            tracing::debug!("WS drain: ACK'd {count} messages");
+        }
+        Err(e) => {
+            tracing::warn!("WS drain failed: {e}");
+        }
+    }
 }
 
 async fn process_pending_sends(

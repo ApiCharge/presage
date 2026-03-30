@@ -99,7 +99,7 @@ fn build_capturing_provider(
         .cipher_suites
         .into_iter()
         .filter(|cs| {
-            cs.suite() == rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+            cs.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
         })
         .collect();
 
@@ -242,19 +242,20 @@ fn parse_tls_record_boundaries(data: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// Derive TLS 1.3 record key and IV from the server traffic secret.
-fn derive_record_key_iv(server_traffic_secret: &[u8]) -> ([u8; 32], [u8; 12]) {
+/// Uses AES-128-GCM-SHA256: 16-byte key, 12-byte IV.
+fn derive_record_key_iv(server_traffic_secret: &[u8]) -> ([u8; 16], [u8; 12]) {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
     let hk = Hkdf::<Sha256>::new(None, server_traffic_secret);
 
-    // HKDF-Expand-Label(Secret, "key", "", 32) — AES-256-GCM = 32-byte keys
+    // HKDF-Expand-Label(Secret, "key", "", 16) — AES-128-GCM = 16-byte keys
     let mut key_info = Vec::new();
-    key_info.extend_from_slice(&(32u16).to_be_bytes());
+    key_info.extend_from_slice(&(16u16).to_be_bytes());
     key_info.push(9); // "tls13 " (6) + "key" (3) = 9
     key_info.extend_from_slice(b"tls13 key");
     key_info.push(0);
-    let mut key = [0u8; 32];
+    let mut key = [0u8; 16];
     hk.expand(&key_info, &mut key).expect("HKDF expand key");
 
     // HKDF-Expand-Label(Secret, "iv", "", 12)
@@ -276,7 +277,7 @@ fn derive_record_key_iv(server_traffic_secret: &[u8]) -> ([u8; 32], [u8; 12]) {
 /// Captured TLS session keys derived from the handshake.
 #[derive(Debug, Clone)]
 pub struct TlsSessionKeys {
-    pub record_key: [u8; 32],
+    pub record_key: [u8; 16],
     pub base_iv: [u8; 12],
     pub client_ephemeral_priv: [u8; 32],
 }

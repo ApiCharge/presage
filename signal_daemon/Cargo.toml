@@ -45,3 +45,6 @@ webpki-roots = "0.26"
 # X25519 ephemeral key capture — StaticSecret exposes to_bytes(), unlike ring's opaque type
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand_core = "0.6"
+
+# HTTP client for zkFetch sidecar calls
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -1,20 +1,28 @@
-//! Message receiver with sealed sender extraction + send processing.
+//! Message receiver implementing the peek → classify → selective ACK → zkFetch flow.
 //!
-//! When TLS polling is enabled (SIGNAL_HOST set), HTTP polling is the ONLY
-//! receive path. The WebSocket is NOT used for receiving — only for sends.
-//! When TLS polling is disabled, falls back to WebSocket reception.
+//! Manager flow:
+//!   1. Peek: GET /v1/messages/ (non-destructive)
+//!   2. Classify: decrypt_envelope() each message locally (no ACK, no WS)
+//!      - Finds SKDM position (if any) and classifies all messages
+//!   3. If no SKDM: open WS, consume all N messages (ACKs them), close
+//!   4. If SKDM at position K:
+//!      a. Open WS, consume K messages before SKDM (ACKs them), close
+//!      b. zkFetch GET /v1/messages/ (SKDM now at front of queue)
+//!      c. Open WS, consume remaining including SKDM (ACKs them), close
+//!   5. Normal messages → relay. SKDM + zkFetch proof → new flow.
+//!
+//! WS decrypt will fail on already-classified messages (Double Ratchet advanced)
+//! but ACK still happens — ACK is sent before decrypt in presage's message pipe.
 
-use crate::api::{ReceivedMessage, SealedEnvelopeDto, VerifiedEnvelopeDto};
+use crate::api::{ReceivedMessage, SkdmEvent};
 use crate::config::DaemonConfig;
-use crate::sealed_sender;
-use crate::tls_poll::TlsPollClient;
 
 use futures::StreamExt;
 use presage::libsignal_service::content::{Content, ContentBody};
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::ServiceId;
 use presage::model::identity::OnNewIdentity;
-use presage::model::messages::Received;
+use presage::model::messages::{DecryptResult, Received};
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 
@@ -31,327 +39,346 @@ pub async fn create_manager(
     Ok(manager)
 }
 
-/// Main receive loop. Two modes:
-///
-/// **TLS polling mode** (SIGNAL_HOST set): HTTP poll is the ONLY receive path.
-/// No WebSocket receive stream. Manager is used only for sends and decrypt_envelope.
-///
-/// **Legacy mode** (no SIGNAL_HOST): WebSocket via presage receive_messages().
+/// Classified message from the peek-decrypt step.
+enum Classified {
+    /// Normal 1-to-1 or group message with decrypted content.
+    Normal(Content),
+    /// SenderKeyDistributionMessage — content was consumed by libsignal.
+    Skdm,
+    /// Empty envelope or decrypt error — skip.
+    Skip,
+}
+
+/// Main receive loop: peek → classify → selective ACK → zkFetch when needed.
 pub async fn run_receive_loop(
     manager: &mut Manager<SqliteStore, presage::manager::Registered>,
     message_queue: Arc<Mutex<Vec<ReceivedMessage>>>,
     config: &DaemonConfig,
     app_state: Arc<Mutex<crate::AppState>>,
-    tls_client: Option<Arc<TlsPollClient>>,
 ) -> anyhow::Result<()> {
-    if tls_client.is_some() {
-        run_tls_poll_loop(manager, config, app_state, tls_client.unwrap()).await
+    tracing::info!("Starting peek-classify-ACK receive loop");
+
+    let mut send_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut peek_interval = tokio::time::interval(std::time::Duration::from_secs(3));
+
+    loop {
+        tokio::select! {
+            _ = send_interval.tick() => {
+                process_pending_sends(manager, &app_state).await;
+            }
+
+            _ = peek_interval.tick() => {
+                if let Err(e) = peek_classify_ack(manager, config, &app_state).await {
+                    tracing::warn!("Peek-classify-ACK error: {e:#}");
+                }
+            }
+        }
+    }
+}
+
+/// The main manager orchestration: peek, classify, selectively ACK, zkFetch if needed.
+async fn peek_classify_ack(
+    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
+    config: &DaemonConfig,
+    app_state: &Arc<Mutex<crate::AppState>>,
+) -> anyhow::Result<()> {
+    // ── Step 1: Peek ──────────────────────────────────────────────────
+    let peek_body = peek_message_queue(config).await?;
+    let envelopes = crate::receiver_parse::parse_envelopes_from_json(&peek_body);
+
+    if envelopes.is_empty() {
+        return Ok(());
+    }
+
+    let count = envelopes.len();
+    tracing::info!("Peek: {count} envelope(s) in queue");
+
+    // ── Step 2: Classify via decrypt_envelope (no WS, no ACK) ─────────
+    let our_uuid = manager.registration_data().service_ids.aci.to_string();
+    let mut classified: Vec<Classified> = Vec::with_capacity(count);
+    let mut skdm_position: Option<usize> = None;
+
+    for (idx, env) in envelopes.iter().enumerate() {
+        if env.content_b64.is_empty() || env.msg_type != 6 {
+            classified.push(Classified::Skip);
+            continue;
+        }
+
+        let content_bytes = match base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &env.content_b64,
+        ) {
+            Ok(b) => b,
+            Err(_) => {
+                classified.push(Classified::Skip);
+                continue;
+            }
+        };
+
+        let envelope = presage::libsignal_service::envelope::Envelope {
+            r#type: Some(6), // UNIDENTIFIED_SENDER
+            content: Some(content_bytes),
+            timestamp: Some(env.timestamp),
+            server_timestamp: Some(env.server_timestamp),
+            destination_service_id: Some(our_uuid.clone()),
+            ..Default::default()
+        };
+
+        match manager.decrypt_envelope(envelope).await {
+            Ok(DecryptResult::Content(content, _mk, _pqr)) => {
+                classified.push(Classified::Normal(content));
+            }
+            Ok(DecryptResult::Skdm) => {
+                if skdm_position.is_none() {
+                    skdm_position = Some(idx);
+                }
+                classified.push(Classified::Skdm);
+                tracing::info!("SKDM detected at queue position {idx}");
+            }
+            Ok(DecryptResult::Empty) => {
+                classified.push(Classified::Skip);
+            }
+            Err(e) => {
+                tracing::debug!("Classify: envelope {idx} decrypt error: {e}");
+                classified.push(Classified::Skip);
+            }
+        }
+    }
+
+    // ── Step 3: Selective ACK via WebSocket ────────────────────────────
+    if let Some(k) = skdm_position {
+        // 3a. ACK messages before the SKDM
+        if k > 0 {
+            tracing::info!("ACKing {k} messages before SKDM");
+            consume_ws_messages(manager, k).await;
+        }
+
+        // 3b. zkFetch the GET (SKDM is now at front of queue)
+        tracing::info!("Calling zkFetch sidecar (SKDM at front of queue)");
+        let proof = call_zkfetch_sidecar(config).await;
+        match &proof {
+            Ok(p) => tracing::info!("zkFetch proof obtained ({} bytes)", p.to_string().len()),
+            Err(e) => tracing::warn!("zkFetch failed: {e:#}"),
+        }
+
+        // 3c. ACK remaining messages including the SKDM
+        let remaining = count - k;
+        tracing::info!("ACKing remaining {remaining} messages (including SKDM)");
+        consume_ws_messages(manager, remaining).await;
+
+        // Store SKDM event
+        {
+            let mut s = app_state.lock().await;
+            s.skdm_events.push(SkdmEvent {
+                raw_envelope: String::new(), // TODO: capture from peek
+                sender: String::new(),
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                zkfetch_proof: proof.ok(),
+            });
+        }
     } else {
-        run_websocket_loop(manager, message_queue, config, app_state).await
+        // No SKDM — ACK everything
+        tracing::debug!("No SKDM, ACKing all {count} messages");
+        consume_ws_messages(manager, count).await;
     }
-}
 
-/// TLS polling mode: HTTP poll only, no WebSocket receive.
-async fn run_tls_poll_loop(
-    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
-    config: &DaemonConfig,
-    app_state: Arc<Mutex<crate::AppState>>,
-    tls_client: Arc<TlsPollClient>,
-) -> anyhow::Result<()> {
-    tracing::info!("Starting TLS poll receive loop (HTTP only, no WebSocket receive)");
+    // ── Step 4: Forward classified messages ────────────────────────────
+    let mut normal_count = 0u32;
+    let mut group_count = 0u32;
+    let mut skdm_count = 0u32;
 
-    // Drain any stale messages from previous runs via WebSocket ACK
-    tracing::info!("Draining stale message queue on startup...");
-    drain_websocket_queue(manager).await;
+    for msg in classified {
+        match msg {
+            Classified::Normal(content) => {
+                let sender_uuid = content.metadata.sender.raw_uuid().to_string();
+                let body = extract_body_text(&content);
 
-    let mut send_interval = tokio::time::interval(std::time::Duration::from_secs(2));
-    let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3));
+                let is_group = matches!(&content.body,
+                    ContentBody::DataMessage(dm) if dm.group_v2.is_some()
+                );
 
-    loop {
-        tokio::select! {
-            // ---- Outbound sends (every 2s) ----
-            _ = send_interval.tick() => {
-                process_pending_sends(manager, &app_state).await;
-            }
+                if is_group {
+                    group_count += 1;
+                    tracing::info!(
+                        "Group message from {}: {} [null bin]",
+                        sender_uuid,
+                        body.as_deref().unwrap_or("<non-text>"),
+                    );
+                    // SenderKey group messages → null bin for now
+                } else {
+                    normal_count += 1;
+                    tracing::info!(
+                        "Message from {}: {}",
+                        sender_uuid,
+                        body.as_deref().unwrap_or("<non-text>"),
+                    );
 
-            // ---- TLS polling: the ONLY receive path ----
-            _ = poll_interval.tick() => {
-                match tls_client.poll_messages().await {
-                    Ok(Some(tls_response)) => {
-                        let session_id = tls_client.current_session_id();
-                        tracing::info!(
-                            "TLS poll: got response ({} records, session {}, ch={}B, sh={}B, eph={})",
-                            tls_response.message_records.len(),
-                            session_id,
-                            tls_response.handshake_data.client_hello.len(),
-                            tls_response.handshake_data.server_hello.len(),
-                            hex::encode(&tls_response.session_keys.client_ephemeral_priv[..4]),
-                        );
+                    let msg = ReceivedMessage {
+                        sender_uuid,
+                        sender_phone: None,
+                        sender_identity_key: None,
+                        timestamp: content.metadata.timestamp,
+                        sealed_envelope: Default::default(),
+                        verified_envelope: None,
+                        decrypted_body: body,
+                    };
 
-                        // Store TLS session setup for the relay
-                        let session_setup = crate::api::TlsSessionSetupDto {
-                            session_id,
-                            client_hello: hex::encode(&tls_response.handshake_data.client_hello),
-                            server_hello: hex::encode(&tls_response.handshake_data.server_hello),
-                            encrypted_handshake: hex::encode(&tls_response.handshake_data.encrypted_handshake_records),
-                            client_ephemeral_priv: hex::encode(tls_response.session_keys.client_ephemeral_priv),
-                        };
-                        {
-                            let mut s = app_state.lock().await;
-                            s.pending_tls_session = Some(session_setup);
-                        }
-
-                        // Log HTTP status for diagnostics
-                        let status = tls_response.response_body
-                            .split(|&b| b == b'\r')
-                            .next()
-                            .map(|l| String::from_utf8_lossy(l).to_string())
-                            .unwrap_or_default();
-                        tracing::info!("TLS poll: {}", status);
-
-                        // Parse envelopes from the HTTP response
-                        let parsed = parse_envelopes_from_protobuf(&tls_response.response_body);
-                        tracing::info!("TLS poll: parsed {} envelope(s)", parsed.len());
-
-                        let mut ack_guids = Vec::new();
-
-                        for (idx, parsed_env) in parsed.iter().enumerate() {
-                            ack_guids.push(parsed_env.guid.clone());
-
-                            let tls_record = tls_response.message_records.get(0);
-
-                            // Extract ECDH shared secrets
-                            let ecdh_result = sealed_sender::extract_sealed_sender(
-                                &parsed_env.content,
-                                &config.identity_private_key,
-                                &config.identity_public_key,
-                            );
-
-                            // Construct libsignal Envelope for presage decryption
-                            let our_uuid = manager.registration_data().service_ids.aci.to_string();
-                            let envelope = presage::libsignal_service::envelope::Envelope {
-                                r#type: Some(6), // UNIDENTIFIED_SENDER
-                                content: Some(parsed_env.content.clone()),
-                                timestamp: Some(parsed_env.timestamp),
-                                server_timestamp: Some(parsed_env.server_timestamp),
-                                destination_service_id: Some(our_uuid),
-                                ..Default::default()
-                            };
-
-                            match manager.decrypt_envelope(envelope).await {
-                                Ok(Some((content, message_key, pqr_salt))) => {
-                                    let sender_uuid = content.metadata.sender.raw_uuid().to_string();
-                                    let body = extract_body_text(&content);
-
-                                    tracing::info!(
-                                        "TLS poll: decrypted from {} (mk={}, pqr={})",
-                                        sender_uuid,
-                                        message_key.as_ref().map(|k| hex::encode(&k[..4])).unwrap_or_else(|| "none".into()),
-                                        pqr_salt.as_ref().map(|k| hex::encode(&k[..4])).unwrap_or_else(|| "none".into()),
-                                    );
-
-                                    let verified_dto = match (&ecdh_result, &message_key, tls_record) {
-                                        (Ok(ecdh), Some(mk), Some(record)) => {
-                                            let pqr_bytes = pqr_salt.as_deref().unwrap_or(&[0u8; 32]);
-                                            Some(VerifiedEnvelopeDto {
-                                                session_id,
-                                                tls_record: hex::encode(&record.raw_bytes),
-                                                tls_sequence_no: record.sequence_no,
-                                                e_shared: hex::encode(ecdh.ecdh.e_shared),
-                                                s_shared: hex::encode(ecdh.ecdh.s_shared),
-                                                message_key: hex::encode(mk),
-                                                pqr_salt: hex::encode(pqr_bytes),
-                                            })
-                                        }
-                                        _ => {
-                                            if let Err(ref e) = ecdh_result {
-                                                tracing::warn!("TLS poll: sealed sender failed for {idx}: {e:#}");
-                                            }
-                                            if message_key.is_none() {
-                                                tracing::warn!("TLS poll: message_key missing for {idx}");
-                                            }
-                                            if tls_record.is_none() {
-                                                tracing::warn!("TLS poll: no TLS record for {idx}");
-                                            }
-                                            None
-                                        }
-                                    };
-
-                                    let sender_identity_hex = ecdh_result.as_ref().ok()
-                                        .map(|r| hex::encode(r.sender_identity_public));
-
-                                    let msg = ReceivedMessage {
-                                        sender_uuid,
-                                        sender_phone: None,
-                                        sender_identity_key: sender_identity_hex,
-                                        timestamp: content.metadata.timestamp,
-                                        sealed_envelope: SealedEnvelopeDto::default(),
-                                        verified_envelope: verified_dto,
-                                        decrypted_body: body,
-                                    };
-
-                                    {
-                                        let mut s = app_state.lock().await;
-                                        s.message_queue.push(msg);
-                                        s.messages_received += 1;
-                                    }
-                                }
-                                Ok(None) => {
-                                    tracing::debug!("TLS poll: empty envelope {idx}");
-                                }
-                                Err(e) => {
-                                    tracing::warn!("TLS poll: decrypt_envelope failed for {idx}: {e}");
-                                }
-                            }
-                        }
-
-                        // ACK messages by briefly opening a WebSocket.
-                        // Signal only ACKs via WS response frames — REST DELETE doesn't exist.
-                        // receive_messages() auto-ACKs on receive; drain until QueueEmpty.
-                        if !parsed.is_empty() {
-                            drain_websocket_queue(manager).await;
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::debug!("TLS poll: no messages");
-                    }
-                    Err(e) => {
-                        tracing::warn!("TLS poll error: {e:#}");
-                    }
+                    let mut s = app_state.lock().await;
+                    s.message_queue.push(msg);
+                    s.messages_received += 1;
                 }
             }
+            Classified::Skdm => {
+                skdm_count += 1;
+            }
+            Classified::Skip => {}
         }
     }
-}
 
-/// Legacy WebSocket mode: presage receive_messages() stream.
-async fn run_websocket_loop(
-    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
-    message_queue: Arc<Mutex<Vec<ReceivedMessage>>>,
-    config: &DaemonConfig,
-    app_state: Arc<Mutex<crate::AppState>>,
-) -> anyhow::Result<()> {
-    tracing::info!("Starting WebSocket receive loop (legacy mode)");
-
-    let messages = manager.receive_messages().await?;
-    futures::pin_mut!(messages);
-
-    let mut send_interval = tokio::time::interval(std::time::Duration::from_secs(2));
-
-    loop {
-        tokio::select! {
-            received = messages.next() => {
-                let Some(received) = received else { break };
-                match received {
-                    Received::Content { content, raw_content, message_key, pqr_salt } => {
-                        let body = extract_body_text(&content);
-                        let sender_uuid = content.metadata.sender.raw_uuid().to_string();
-                        let was_sealed = content.metadata.unidentified_sender;
-
-                        let mut sealed_dto = None;
-                        let mut sender_identity_hex = None;
-
-                        if was_sealed {
-                            if let Some(raw) = raw_content.as_deref() {
-                                match sealed_sender::extract_sealed_sender(raw, &config.identity_private_key, &config.identity_public_key) {
-                                    Ok(result) => {
-                                        sender_identity_hex = Some(hex::encode(result.sender_identity_public));
-
-                                        if let Some(ref mk) = message_key {
-                                            let pqr_hex = pqr_salt.as_ref().map(|s| hex::encode(s)).unwrap_or_default();
-                                            tracing::info!("Got message_key ({} bytes), pqr_salt={}", mk.len(), if pqr_hex.is_empty() { "none" } else { &pqr_hex[..8] });
-                                            sealed_dto = Some(SealedEnvelopeDto {
-                                                s_cipher_key: hex::encode(result.envelope.s_cipher_key),
-                                                s_mac_key: hex::encode(result.envelope.s_mac_key),
-                                                s_ciphertext: hex::encode(&result.envelope.s_ciphertext),
-                                                s_mac: hex::encode(result.envelope.s_mac),
-                                                message_key: hex::encode(mk),
-                                                pqr_salt: pqr_hex,
-                                            });
-                                        } else {
-                                            tracing::warn!("No message_key captured from libsignal");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Sealed sender extraction failed: {e:#}");
-                                    }
-                                }
-                            }
-                        }
-
-                        tracing::info!(
-                            "Message from {}: {} [sealed={}]",
-                            sender_uuid,
-                            body.as_deref().unwrap_or("<non-text>"),
-                            sealed_dto.is_some(),
-                        );
-
-                        let msg = ReceivedMessage {
-                            sender_uuid,
-                            sender_phone: None,
-                            sender_identity_key: sender_identity_hex,
-                            timestamp: content.metadata.timestamp,
-                            sealed_envelope: sealed_dto.unwrap_or_default(),
-                            verified_envelope: None,
-                            decrypted_body: body,
-                        };
-
-                        message_queue.lock().await.push(msg.clone());
-                        {
-                            let mut s = app_state.lock().await;
-                            s.message_queue.push(msg);
-                            s.messages_received += 1;
-                        }
-                    }
-                    Received::QueueEmpty => {
-                        tracing::debug!("Queue empty, waiting for messages...");
-                    }
-                    _ => {}
-                }
-            }
-
-            _ = send_interval.tick() => {
-                process_pending_sends(manager, &app_state).await;
-            }
-        }
+    if normal_count + group_count + skdm_count > 0 {
+        tracing::info!(
+            "Processed: {normal_count} normal, {group_count} group (null bin), {skdm_count} SKDM"
+        );
     }
 
     Ok(())
 }
 
-/// Briefly open a WebSocket to drain and ACK all pending messages.
-/// Signal only removes messages from the queue via WebSocket ACK frames.
-/// We don't process the content — just let presage auto-ACK everything.
-async fn drain_websocket_queue(
+/// Open WebSocket, consume exactly `count` messages (ACKing each), then close.
+/// The WS ACKs happen before decryption in presage's message pipe, so even if
+/// decrypt fails (because we already decrypted in the classify step), ACK succeeds.
+async fn consume_ws_messages(
     manager: &mut Manager<SqliteStore, presage::manager::Registered>,
+    count: usize,
 ) {
-    tracing::debug!("Draining message queue via WebSocket ACK...");
+    if count == 0 {
+        return;
+    }
+
     match manager.receive_messages().await {
         Ok(stream) => {
             futures::pin_mut!(stream);
-            let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
+            let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
             tokio::pin!(timeout);
-            let mut count = 0u32;
+
+            let mut consumed = 0usize;
             loop {
+                if consumed >= count {
+                    break;
+                }
                 tokio::select! {
                     item = stream.next() => {
                         match item {
                             Some(Received::QueueEmpty) | None => break,
-                            Some(_) => { count += 1; }
+                            Some(_) => { consumed += 1; }
                         }
                     }
                     _ = &mut timeout => {
-                        tracing::debug!("WS drain timeout after {count} messages");
+                        tracing::debug!("WS consume timeout after {consumed}/{count}");
                         break;
                     }
                 }
             }
-            tracing::debug!("WS drain: ACK'd {count} messages");
+            tracing::debug!("WS consumed {consumed}/{count} messages");
+            // Stream dropped here — WS closes, remaining messages stay in queue
         }
         Err(e) => {
-            tracing::warn!("WS drain failed: {e}");
+            tracing::warn!("WS consume failed: {e}");
         }
     }
+}
+
+/// Call the zkFetch sidecar to get a proof of Signal's GET /v1/messages/ response.
+async fn call_zkfetch_sidecar(config: &DaemonConfig) -> anyhow::Result<serde_json::Value> {
+    let sidecar_url = std::env::var("ZKFETCH_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:7585".to_string());
+
+    let auth = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        format!("{}:{}", config.uuid, config.password),
+    );
+
+    let signal_url = format!("https://{}/v1/messages/", config.signal_host);
+
+    let request_body = serde_json::json!({
+        "url": signal_url,
+        "publicOptions": {
+            "method": "GET",
+        },
+        "privateOptions": {
+            "headers": {
+                "Authorization": format!("Basic {auth}")
+            }
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{sidecar_url}/zkfetch"))
+        .json(&request_body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("zkFetch sidecar returned {status}: {body}");
+    }
+
+    let result: serde_json::Value = response.json().await?;
+    Ok(result.get("proof").cloned().unwrap_or(result))
+}
+
+/// Peek Signal's message queue via plain HTTPS GET.
+async fn peek_message_queue(config: &DaemonConfig) -> anyhow::Result<Vec<u8>> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let der = include_bytes!("signal_root_ca.der");
+    root_store
+        .add(rustls::pki_types::CertificateDer::from(&der[..]))
+        .expect("Signal root CA is valid");
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+    let host = &config.signal_host;
+    let server_name = rustls::pki_types::ServerName::try_from(host.clone())?;
+
+    let tcp = tokio::net::TcpStream::connect(format!("{host}:443")).await?;
+    let mut tls = connector.connect(server_name, tcp).await?;
+
+    let auth = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        format!("{}:{}", config.uuid, config.password),
+    );
+    let request = format!(
+        "GET /v1/messages/ HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Authorization: Basic {auth}\r\n\
+         Connection: close\r\n\
+         \r\n",
+    );
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tls.write_all(request.as_bytes()).await?;
+    tls.flush().await?;
+
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await?;
+
+    let body_start = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(0);
+
+    Ok(response[body_start..].to_vec())
 }
 
 async fn process_pending_sends(
@@ -389,201 +416,6 @@ async fn process_pending_sends(
             Err(e) => tracing::error!("Send failed to {}: {e:#}", send.recipient),
         }
     }
-}
-
-// ============================================================================
-// Protobuf envelope parsing for Signal's GET /v1/messages response
-// ============================================================================
-
-pub struct ParsedEnvelope {
-    pub content: Vec<u8>,
-    pub timestamp: u64,
-    pub server_timestamp: u64,
-    pub guid: String,
-}
-
-/// Parse envelopes from an HTTP response body.
-/// Tries protobuf first, falls back to JSON.
-fn parse_envelopes_from_protobuf(http_response: &[u8]) -> Vec<ParsedEnvelope> {
-    let body = match find_http_body(http_response) {
-        Some(b) => b,
-        None => http_response,
-    };
-
-    if body.is_empty() {
-        return Vec::new();
-    }
-
-    // Try protobuf first, fall back to JSON
-    if body.first() == Some(&0x0a) || body.first().map(|b| b & 0x07 == 2).unwrap_or(false) {
-        parse_incoming_message_list_protobuf(body)
-    } else if body.first() == Some(&b'{') || body.first() == Some(&b'[') {
-        parse_envelopes_json(body)
-    } else {
-        tracing::warn!("TLS poll: unknown response format (first byte: {:02x})", body.first().unwrap_or(&0));
-        Vec::new()
-    }
-}
-
-fn find_http_body(data: &[u8]) -> Option<&[u8]> {
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i + 4] == b"\r\n\r\n" {
-            return Some(&data[i + 4..]);
-        }
-    }
-    None
-}
-
-fn parse_incoming_message_list_protobuf(data: &[u8]) -> Vec<ParsedEnvelope> {
-    let mut envelopes = Vec::new();
-    let mut pos = 0;
-
-    while pos < data.len() {
-        let Ok((field, wire_type)) = pb_read_tag(data, &mut pos) else { break };
-        match (field, wire_type) {
-            (1, 2) => {
-                let Ok(envelope_bytes) = pb_read_bytes(data, &mut pos) else { break };
-                if let Some(env) = parse_signal_envelope_protobuf(&envelope_bytes) {
-                    envelopes.push(env);
-                }
-            }
-            (_, wt) => {
-                if pb_skip_field(data, &mut pos, wt).is_err() {
-                    break;
-                }
-            }
-        }
-    }
-
-    envelopes
-}
-
-fn parse_signal_envelope_protobuf(data: &[u8]) -> Option<ParsedEnvelope> {
-    let mut pos = 0;
-    let mut content: Option<Vec<u8>> = None;
-    let mut timestamp: u64 = 0;
-    let mut server_timestamp: u64 = 0;
-    let mut guid = String::new();
-    let mut r#type: u32 = 0;
-
-    while pos < data.len() {
-        let Ok((field, wire_type)) = pb_read_tag(data, &mut pos) else { break };
-        match (field, wire_type) {
-            (1, 0) => { r#type = pb_read_varint(data, &mut pos).unwrap_or(0) as u32; }
-            (3, 0) => { timestamp = pb_read_varint(data, &mut pos).unwrap_or(0); }
-            (8, 2) => { content = pb_read_bytes(data, &mut pos).ok(); }
-            (10, 0) => { server_timestamp = pb_read_varint(data, &mut pos).unwrap_or(0); }
-            (13, 2) => {
-                if let Ok(bytes) = pb_read_bytes(data, &mut pos) {
-                    guid = String::from_utf8_lossy(&bytes).to_string();
-                }
-            }
-            (_, wt) => {
-                if pb_skip_field(data, &mut pos, wt).is_err() { break; }
-            }
-        }
-    }
-
-    let content = content?;
-    if content.is_empty() { return None; }
-
-    if r#type != 6 {
-        tracing::debug!("Skipping non-sealed-sender envelope type {}", r#type);
-        return None;
-    }
-
-    if timestamp == 0 { timestamp = server_timestamp; }
-
-    Some(ParsedEnvelope { content, timestamp, server_timestamp, guid })
-}
-
-fn parse_envelopes_json(body: &[u8]) -> Vec<ParsedEnvelope> {
-    let body_str = match std::str::from_utf8(body) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let value: serde_json::Value = match serde_json::from_str(body_str) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    let messages = match value.get("messages").and_then(|m| m.as_array()) {
-        Some(arr) => arr,
-        None => return Vec::new(),
-    };
-
-    let mut envelopes = Vec::new();
-    for msg in messages {
-        let msg_type = msg.get("type").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
-        if msg_type != 6 { continue; }
-
-        let content_b64 = match msg.get("content").and_then(|c| c.as_str()) {
-            Some(s) => s,
-            None => continue,
-        };
-        let content = match base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            content_b64,
-        ) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-
-        let timestamp = msg.get("timestamp").and_then(|t| t.as_u64()).unwrap_or(0);
-        let server_timestamp = msg.get("serverTimestamp").and_then(|t| t.as_u64()).unwrap_or(0);
-        let guid = msg.get("guid").and_then(|g| g.as_str()).unwrap_or("").to_string();
-
-        envelopes.push(ParsedEnvelope { content, timestamp, server_timestamp, guid });
-    }
-
-    envelopes
-}
-
-// ============================================================================
-// Minimal protobuf wire format helpers
-// ============================================================================
-
-fn pb_read_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<u64> {
-    let mut result: u64 = 0;
-    let mut shift = 0u32;
-    loop {
-        anyhow::ensure!(*pos < data.len(), "varint: unexpected end");
-        let byte = data[*pos];
-        *pos += 1;
-        result |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 { return Ok(result); }
-        shift += 7;
-        anyhow::ensure!(shift < 64, "varint overflow");
-    }
-}
-
-fn pb_read_tag(data: &[u8], pos: &mut usize) -> anyhow::Result<(u32, u32)> {
-    let v = pb_read_varint(data, pos)?;
-    Ok(((v >> 3) as u32, (v & 0x07) as u32))
-}
-
-fn pb_read_bytes(data: &[u8], pos: &mut usize) -> anyhow::Result<Vec<u8>> {
-    let len = pb_read_varint(data, pos)? as usize;
-    anyhow::ensure!(*pos + len <= data.len(), "bytes field overflows buffer");
-    let result = data[*pos..*pos + len].to_vec();
-    *pos += len;
-    Ok(result)
-}
-
-fn pb_skip_field(data: &[u8], pos: &mut usize, wire_type: u32) -> anyhow::Result<()> {
-    match wire_type {
-        0 => { pb_read_varint(data, pos)?; }
-        1 => *pos += 8,
-        2 => {
-            let len = pb_read_varint(data, pos)? as usize;
-            anyhow::ensure!(*pos + len <= data.len(), "skip: overflow");
-            *pos += len;
-        }
-        5 => *pos += 4,
-        wt => anyhow::bail!("unknown wire type: {wt}"),
-    }
-    Ok(())
 }
 
 fn extract_body_text(content: &Content) -> Option<String> {

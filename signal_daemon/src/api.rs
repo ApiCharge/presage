@@ -95,3 +95,17 @@ pub struct SendResponse {
     pub success: bool,
     pub error: Option<String>,
 }
+
+/// A detected SenderKeyDistributionMessage event.
+/// The daemon surfaces these so the relay can trigger zkFetch attestation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkdmEvent {
+    /// Hex-encoded raw sealed sender envelope bytes
+    pub raw_envelope: String,
+    /// Sender's service ID (if known)
+    pub sender: String,
+    /// Detection timestamp (millis since epoch)
+    pub timestamp: u64,
+    /// zkFetch proof JSON (populated after attestation, None initially)
+    pub zkfetch_proof: Option<serde_json::Value>,
+}

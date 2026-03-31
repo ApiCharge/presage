@@ -1,0 +1,10 @@
+{
+  "name": "zkfetch-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "zkFetch sidecar for Signal SKDM attestation",
+  "main": "server.js",
+  "dependencies": {
+    "@reclaimprotocol/zk-fetch": "^2"
+  }
+}

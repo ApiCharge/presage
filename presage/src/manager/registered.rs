@@ -52,7 +52,7 @@ use crate::serde::serde_profile_key;
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
-pub use crate::model::messages::Received;
+pub use crate::model::messages::{DecryptResult, Received};
 
 type ServiceCipher<S> = cipher::ServiceCipher<S>;
 type MessageSender<S> = libsignal_service::prelude::MessageSender<S>;
@@ -873,7 +873,21 @@ impl<S: Store> Manager<S, Registered> {
                                     return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), message_key, pqr_salt }, state));
                                 }
                                 Ok(None) => {
-                                    debug!("empty envelope, message will be skipped!")
+                                    // open_envelope returns None for SKDMs (processed internally)
+                                    // and for genuinely empty envelopes. Distinguish by checking
+                                    // if the envelope had content (raw_content.is_some()) AND
+                                    // if a message key was captured (meaning decryption happened).
+                                    let mk = libsignal_protocol::LAST_MESSAGE_KEY.with(|cell| cell.borrow_mut().take());
+                                    let _ = libsignal_protocol::LAST_PQR_SALT.with(|cell| cell.borrow_mut().take());
+                                    if raw_content.is_some() && mk.is_some() {
+                                        debug!("SKDM detected (envelope decrypted but content filtered)");
+                                        return Some((Received::SenderKeyDistribution {
+                                            raw_content: raw_content.clone(),
+                                            sender: String::new(), // sender unknown from Ok(None)
+                                        }, state));
+                                    } else {
+                                        debug!("empty envelope, message will be skipped!")
+                                    }
                                 }
                                 Err(error) => {
                                     error!(%error, "error opening envelope, message will be skipped!");
@@ -1370,10 +1384,11 @@ impl<S: Store> Manager<S, Registered> {
     ///
     /// Safe to call while `receive_messages()` stream is live — that stream
     /// cloned the store and cipher into its own state, so `self` is free.
+    /// Result of decrypt_envelope: either a normal message, an SKDM (content filtered), or empty.
     pub async fn decrypt_envelope(
         &mut self,
         envelope: libsignal_service::envelope::Envelope,
-    ) -> Result<Option<(Content, Option<Vec<u8>>, Option<Vec<u8>>)>, Error<S::Error>> {
+    ) -> Result<DecryptResult, Error<S::Error>> {
         let mut cipher = self.new_service_cipher_aci();
         let content = cipher
             .open_envelope(envelope, &mut rng())
@@ -1384,7 +1399,11 @@ impl<S: Store> Manager<S, Registered> {
             libsignal_protocol::LAST_MESSAGE_KEY.with(|cell| cell.borrow_mut().take());
         let pqr_salt = libsignal_protocol::LAST_PQR_SALT.with(|cell| cell.borrow_mut().take());
 
-        Ok(content.map(|c| (c, message_key, pqr_salt)))
+        match content {
+            Some(c) => Ok(DecryptResult::Content(c, message_key, pqr_salt)),
+            None if message_key.is_some() => Ok(DecryptResult::Skdm),
+            None => Ok(DecryptResult::Empty),
+        }
     }
 
     fn new_service_cipher_aci(&self) -> ServiceCipher<S::AciStore> {

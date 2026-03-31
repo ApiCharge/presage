@@ -70,6 +70,8 @@ pub struct DaemonConfig {
     pub listen_addr: String,
     /// signal-cli data directory (for session SQLite database)
     pub data_dir: String,
+    /// Signal server host for REST API (e.g., "chat.signal.org")
+    pub signal_host: String,
 }
 
 impl DaemonConfig {
@@ -144,6 +146,8 @@ impl DaemonConfig {
             profile_key: account.profile_key.clone(),
             listen_addr: listen_addr.to_string(),
             data_dir: data_dir.to_string(),
+            signal_host: std::env::var("SIGNAL_HOST")
+                .unwrap_or_else(|_| "chat.signal.org".to_string()),
         })
     }
 }

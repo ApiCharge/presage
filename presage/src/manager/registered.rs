@@ -1845,8 +1845,10 @@ impl<S: Store> Manager<S, Registered> {
         // The response JSON includes a "credential" field with base64-encoded
         // ExpiringProfileKeyCredentialResponse
         #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct ProfileCredentialResponse {
-            credential: String,
+            expiring_profile_key_credential: Option<String>,
+            credential: Option<String>,
         }
 
         let response_text = response.text().await.map_err(|e| {
@@ -1861,8 +1863,14 @@ impl<S: Store> Manager<S, Registered> {
                 Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error)
             })?;
 
+        let credential_b64 = profile_response.expiring_profile_key_credential
+            .or(profile_response.credential)
+            .ok_or_else(|| {
+                error!("profile response contains neither expiringProfileKeyCredential nor credential field");
+                Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error)
+            })?;
         let credential_response_bytes = BASE64_STANDARD
-            .decode(&profile_response.credential)
+            .decode(&credential_b64)
             .map_err(|e| {
                 error!("failed to base64-decode credential response: {e}");
                 libsignal_service::prelude::ServiceError::GroupsV2Error

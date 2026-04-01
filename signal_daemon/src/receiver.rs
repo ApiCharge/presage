@@ -45,6 +45,7 @@ pub async fn run_receive_loop(
         tokio::select! {
             _ = send_interval.tick() => {
                 process_pending_sends(manager, &app_state).await;
+                process_pending_group_sends(manager, &app_state).await;
                 process_pending_group_creates(manager, &app_state).await;
             }
 
@@ -160,6 +161,44 @@ async fn process_pending_sends(
         match manager.send_message(service_id, body, timestamp).await {
             Ok(()) => tracing::info!("Sent successfully to {}", send.recipient),
             Err(e) => tracing::error!("Send failed to {}: {e:#}", send.recipient),
+        }
+    }
+}
+
+async fn process_pending_group_sends(
+    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
+    app_state: &Arc<Mutex<crate::AppState>>,
+) {
+    let sends: Vec<crate::PendingGroupSend> = {
+        let mut s = app_state.lock().await;
+        std::mem::take(&mut s.group_send_queue)
+    };
+
+    for send in sends {
+        tracing::info!("Sending to group {}: {}", send.group_id, send.message);
+
+        let master_key_bytes = match hex::decode(&send.group_id) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                tracing::error!("Invalid group_id hex: {}", send.group_id);
+                continue;
+            }
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let body = ContentBody::DataMessage(presage::libsignal_service::proto::DataMessage {
+            body: Some(send.message.clone()),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        });
+
+        match manager.send_message_to_group(&master_key_bytes, body, timestamp).await {
+            Ok(()) => tracing::info!("Sent to group {} successfully", send.group_id),
+            Err(e) => tracing::error!("Group send failed to {}: {e:#}", send.group_id),
         }
     }
 }

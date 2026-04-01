@@ -37,9 +37,16 @@ pub struct PendingGroupCreate {
     pub response_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
 }
 
+/// Outbound group send request queued by the HTTP handler, processed by the receiver thread.
+pub struct PendingGroupSend {
+    pub group_id: String,
+    pub message: String,
+}
+
 pub struct AppState {
     pub message_queue: Vec<ReceivedMessage>,
     pub send_queue: Vec<PendingSend>,
+    pub group_send_queue: Vec<PendingGroupSend>,
     pub group_create_queue: Vec<PendingGroupCreate>,
     pub messages_received: u64,
     pub connected: bool,
@@ -103,6 +110,7 @@ async fn async_main() -> anyhow::Result<()> {
     let state: SharedState = Arc::new(Mutex::new(AppState {
         message_queue: Vec::new(),
         send_queue: Vec::new(),
+        group_send_queue: Vec::new(),
         group_create_queue: Vec::new(),
         messages_received: 0,
         connected: false,
@@ -163,6 +171,7 @@ async fn async_main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/receive", get(handle_receive))
         .route("/send", post(handle_send))
+        .route("/send-group", post(handle_send_group))
         .route("/status", get(handle_status))
         .route("/create-group", post(handle_create_group))
         .route("/tee-pubkey", get(handle_tee_pubkey))
@@ -191,6 +200,22 @@ async fn handle_send(
     let mut s = state.lock().await;
     s.send_queue.push(PendingSend {
         recipient: req.recipient,
+        message: req.message,
+    });
+    Json(SendResponse {
+        success: true,
+        error: None,
+    })
+}
+
+async fn handle_send_group(
+    State(state): State<SharedState>,
+    Json(req): Json<GroupSendRequest>,
+) -> Json<SendResponse> {
+    tracing::info!("Queuing group send to {}: {}", req.group_id, req.message);
+    let mut s = state.lock().await;
+    s.group_send_queue.push(PendingGroupSend {
+        group_id: req.group_id,
         message: req.message,
     });
     Json(SendResponse {

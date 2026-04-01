@@ -88,6 +88,13 @@ pub struct SendResponse {
     pub error: Option<String>,
 }
 
+/// Request for POST /send-group
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GroupSendRequest {
+    pub group_id: String, // hex-encoded group master key
+    pub message: String,
+}
+
 /// Request for POST /create-group
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateGroupRequest {

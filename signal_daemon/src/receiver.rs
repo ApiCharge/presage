@@ -4,7 +4,6 @@
 //! decrypts incoming envelopes, and forwards them to the HTTP API queue.
 
 use crate::api::ReceivedMessage;
-use crate::config::DaemonConfig;
 
 use ed25519_dalek::Signer;
 use futures::StreamExt;
@@ -33,7 +32,6 @@ pub async fn create_manager(
 pub async fn run_receive_loop(
     manager: &mut Manager<SqliteStore, presage::manager::Registered>,
     _message_queue: Arc<Mutex<Vec<ReceivedMessage>>>,
-    _config: &DaemonConfig,
     app_state: Arc<Mutex<crate::AppState>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Starting WebSocket receive loop");

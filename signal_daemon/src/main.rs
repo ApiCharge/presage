@@ -8,7 +8,6 @@
 //!   Signal servers <-> presage (WebSocket) <-> This daemon <-> HTTP <-> .NET relay
 
 mod api;
-mod config;
 mod message_keys;
 mod receiver;
 mod sealed_sender;
@@ -74,25 +73,7 @@ async fn async_main() -> anyhow::Result<()> {
         return register_account(&db_path).await;
     }
 
-    let signal_cli_dir = std::env::var("SIGNAL_CLI_DATA_DIR")
-        .map_err(|_| anyhow::anyhow!("SIGNAL_CLI_DATA_DIR must be set"))?;
-
-    // Load identity keys from signal-cli data
-    let daemon_config = config::DaemonConfig::from_signal_cli_data(&signal_cli_dir, &listen_addr)?;
-    tracing::info!("Loaded identity for {} ({})", daemon_config.phone_number, daemon_config.uuid);
-
-    // One-shot migration: only create store if it doesn't exist
-    let db_file = db_path
-        .strip_prefix("sqlite://")
-        .and_then(|s| s.split('?').next())
-        .unwrap_or(&db_path);
-    if !std::path::Path::new(db_file).exists() {
-        tracing::info!("Creating presage store at {db_path} from signal-cli data...");
-        init_presage_store(&db_path, &daemon_config).await?;
-        tracing::info!("Presage store created.");
-    } else {
-        tracing::info!("Presage store exists at {db_file}, skipping migration.");
-    }
+    tracing::info!("Using presage store at {db_path}");
 
     // Load or generate TEE Ed25519 signing key
     let tee_signing_key = match std::env::var("TEE_SIGNING_KEY") {
@@ -125,15 +106,14 @@ async fn async_main() -> anyhow::Result<()> {
         group_create_queue: Vec::new(),
         messages_received: 0,
         connected: false,
-        phone_number: daemon_config.phone_number.clone(),
-        uuid: daemon_config.uuid.clone(),
+        phone_number: String::new(),
+        uuid: String::new(),
         tee_signing_key,
     }));
 
     // Run the receiver on a dedicated OS thread (presage futures are huge in debug)
     let recv_state = state.clone();
     let recv_db = db_path.clone();
-    let recv_config = daemon_config.clone();
     std::thread::Builder::new()
         .name("presage-receiver".into())
         .stack_size(16 * 1024 * 1024)
@@ -162,7 +142,7 @@ async fn async_main() -> anyhow::Result<()> {
 
                 loop {
                     let queue = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                    match receiver::run_receive_loop(&mut manager, queue.clone(), &recv_config, recv_state.clone()).await {
+                    match receiver::run_receive_loop(&mut manager, queue.clone(), recv_state.clone()).await {
                         Ok(()) => tracing::info!("Receiver ended, reconnecting in 10s..."),
                         Err(e) => tracing::error!("Receiver error: {e:#}, reconnecting in 10s..."),
                     }
@@ -286,75 +266,6 @@ async fn handle_tee_pubkey(State(state): State<SharedState>) -> Json<TeePubkeyRe
     let s = state.lock().await;
     let pubkey_hex = hex::encode(s.tee_signing_key.verifying_key().as_bytes());
     Json(TeePubkeyResponse { pubkey_hex })
-}
-
-/// Create a presage-compatible SQLite store from signal-cli credentials.
-/// Opens SqliteStore (runs migrations), then writes registration + identity via the exposed pool.
-async fn init_presage_store(db_path: &str, cfg: &config::DaemonConfig) -> anyhow::Result<()> {
-    use base64::Engine;
-    use presage::libsignal_service::protocol::{IdentityKeyPair, PrivateKey, PublicKey};
-    use presage::model::identity::OnNewIdentity;
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    // Open store with create_if_missing (open_with_passphrase sets it, open does not)
-    let store = presage_store_sqlite::SqliteStore::open_with_passphrase(db_path, None, OnNewIdentity::Trust).await?;
-
-    let phone = phonenumber::parse(None, &cfg.phone_number)?;
-    let reg = serde_json::json!({
-        "signal_servers": "Production",
-        "device_name": null,
-        "phone_number": serde_json::to_value(&phone)?,
-        "uuid": cfg.uuid,
-        "pni": cfg.pni_uuid.as_deref().unwrap_or("00000000-0000-0000-0000-000000000000"),
-        "password": cfg.password,
-        "signaling_key": b64.encode([0u8; 52]),
-        "device_id": if cfg.device_id == 1 { serde_json::Value::Null } else { serde_json::json!(cfg.device_id) },
-        "registration_id": cfg.registration_id,
-        "pni_registration_id": cfg.pni_registration_id,
-        "profile_key": cfg.profile_key.as_deref().unwrap_or("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
-    });
-
-    sqlx::query("INSERT OR REPLACE INTO kv (key, value) VALUES ('registration', ?)")
-        .bind(serde_json::to_string(&reg)?)
-        .execute(&store.db)
-        .await?;
-
-    let kp = IdentityKeyPair::new(
-        PublicKey::deserialize(&{
-            let mut k = vec![0x05];
-            k.extend_from_slice(&cfg.identity_public_key);
-            k
-        })?.into(),
-        PrivateKey::deserialize(&cfg.identity_private_key)?,
-    );
-    // Key name must match presage's IdentityType::identity_key_pair_key() = "identity_keypair_aci"
-    // Value is raw protobuf bytes (IdentityKeyPair::serialize()), NOT base64 or JSON
-    let kp_bytes = kp.serialize();
-    sqlx::query("INSERT OR REPLACE INTO kv (key, value) VALUES ('identity_keypair_aci', ?)")
-        .bind(&*kp_bytes)
-        .execute(&store.db)
-        .await?;
-
-    // PNI identity key pair (required for register_pre_keys which updates both ACI and PNI)
-    if let Some(ref pni) = cfg.pni_identity_private_key {
-        let pni_pub_bytes = cfg.pni_identity_public_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("PNI public key missing"))?;
-        let mut pub_with_prefix = vec![0x05];
-        pub_with_prefix.extend_from_slice(pni_pub_bytes);
-        let pni_kp = IdentityKeyPair::new(
-            PublicKey::deserialize(&pub_with_prefix)?.into(),
-            PrivateKey::deserialize(pni)?,
-        );
-        sqlx::query("INSERT OR REPLACE INTO kv (key, value) VALUES ('identity_keypair_pni', ?)")
-            .bind(&*pni_kp.serialize())
-            .execute(&store.db)
-            .await?;
-        tracing::info!("PNI identity key pair written");
-    }
-
-    tracing::info!("Registration + identity key pairs written. Pre-keys will be generated by presage on connect.");
-
-    Ok(())
 }
 
 /// Interactive registration via SMS verification code.

@@ -1520,10 +1520,14 @@ impl<S: Store> Manager<S, Registered> {
     /// Creates a new Signal GroupV2 with the given title and member ACIs.
     ///
     /// The group is created on Signal's storage service with the caller as
-    /// the sole ADMINISTRATOR member. Other members specified in
-    /// `member_acis` are added as pending members (invited). This avoids
-    /// the need for profile key credential presentations, which require
-    /// server round-trips not yet implemented in presage.
+    /// the sole ADMINISTRATOR member with a valid `ExpiringProfileKeyCredentialPresentation`.
+    /// Other members specified in `member_acis` are added as pending members (invited).
+    ///
+    /// The credential flow:
+    /// 1. Create a profile key credential request context
+    /// 2. Send the request to Signal's profile endpoint to get a credential response
+    /// 3. Receive and verify the credential
+    /// 4. Create a presentation for the group
     ///
     /// Returns the 32-byte group master key which uniquely identifies the
     /// group and is needed for all subsequent group operations.
@@ -1549,6 +1553,19 @@ impl<S: Store> Manager<S, Registered> {
         // 3. Build the encrypted group protobuf
         let our_aci: Aci = self.state.data.service_ids.aci();
         let our_profile_key: ProfileKey = self.state.data.profile_key;
+        let service_configuration = self.state.service_configuration();
+        let server_public_params = service_configuration.zkgroup_server_public_params;
+
+        // 3a. Obtain ExpiringProfileKeyCredentialPresentation for the creator
+        let presentation = self
+            .get_expiring_profile_key_credential_presentation(
+                our_aci,
+                our_profile_key,
+                &server_public_params,
+                group_secret_params,
+            )
+            .await?;
+        let presentation_bytes = libsignal_service::zkgroup::serialize(&presentation);
 
         // Encrypt the group public key (bincode-serialized GroupPublicParams)
         let group_public_params = group_secret_params.get_public_params();
@@ -1575,7 +1592,7 @@ impl<S: Store> Manager<S, Registered> {
         let encrypted_title =
             group_secret_params.encrypt_blob_with_padding(title_randomness, &title_plaintext, 0);
 
-        // Encrypt our own member entry
+        // Encrypt our own member entry (with valid credential presentation)
         let encrypted_user_id =
             bincode::serialize(&group_secret_params.encrypt_service_id(our_aci.into()))
                 .map_err(|e| {
@@ -1593,7 +1610,7 @@ impl<S: Store> Manager<S, Registered> {
             user_id: encrypted_user_id,
             role: libsignal_service::proto::member::Role::Administrator.into(),
             profile_key: encrypted_profile_key,
-            presentation: vec![], // TODO: presentation requires ExpiringProfileKeyCredential flow
+            presentation: presentation_bytes,
             joined_at_revision: 0,
         };
 
@@ -1675,10 +1692,11 @@ impl<S: Store> Manager<S, Registered> {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body_text = response.text().await.unwrap_or_default();
             error!(
+                status_code = %status.as_u16(),
                 status = %status,
-                body = %body,
+                body = %body_text,
                 "failed to create group on server"
             );
             return Err(libsignal_service::prelude::ServiceError::GroupsV2Error.into());
@@ -1726,6 +1744,149 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         Ok(master_key_bytes)
+    }
+
+    /// Fetches an `ExpiringProfileKeyCredentialPresentation` for the given ACI.
+    ///
+    /// This performs the full credential flow:
+    /// 1. Creates a credential request context using zkgroup
+    /// 2. Sends the request to Signal's profile endpoint
+    /// 3. Receives and verifies the credential response
+    /// 4. Creates a presentation bound to the given group
+    async fn get_expiring_profile_key_credential_presentation(
+        &self,
+        aci: Aci,
+        profile_key: ProfileKey,
+        server_public_params: &libsignal_service::zkgroup::ServerPublicParams,
+        group_secret_params: GroupSecretParams,
+    ) -> Result<
+        libsignal_service::zkgroup::profiles::ExpiringProfileKeyCredentialPresentation,
+        Error<S::Error>,
+    > {
+        use base64::prelude::*;
+
+        // Step 1: Create the credential request context
+        let mut request_randomness = [0u8; 32];
+        rand::Rng::fill(&mut rand::rng(), &mut request_randomness);
+        let request_context = server_public_params
+            .create_profile_key_credential_request_context(
+                request_randomness,
+                aci,
+                profile_key,
+            );
+        let request = request_context.get_request();
+
+        // Step 2: Build the profile endpoint URL with credential request
+        let profile_key_version =
+            bincode::serialize(&profile_key.get_profile_key_version(aci))
+                .map_err(|e| {
+                    error!("failed to serialize profile key version: {e}");
+                    libsignal_service::prelude::ServiceError::GroupsV2Error
+                })?;
+        let version_str = std::str::from_utf8(&profile_key_version)
+            .expect("profile key version is hex encoded");
+
+        let credential_request_bytes = libsignal_service::zkgroup::serialize(&request);
+        let credential_request_hex = hex::encode(&credential_request_bytes);
+
+        let path = format!(
+            "/v1/profile/{}/{}?credentialType=expiringProfileKey&credentialVersion=0&zkc={}",
+            aci.service_id_string(),
+            version_str,
+            credential_request_hex,
+        );
+
+        debug!("requesting expiring profile key credential from {}", path);
+
+        // Step 3: Send the request to Signal's service
+        let push_service = self.identified_push_service();
+        let response = push_service
+            .request(
+                Method::GET,
+                Endpoint::service(path),
+                HttpAuthOverride::NoOverride,
+            )?
+            .send()
+            .await
+            .map_err(|e| {
+                error!("failed to send profile credential request: {e}");
+                Error::ServiceError(e.into())
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            error!(
+                status_code = %status.as_u16(),
+                status = %status,
+                body = %body_text,
+                "failed to get profile key credential from server"
+            );
+            return Err(libsignal_service::prelude::ServiceError::GroupsV2Error.into());
+        }
+
+        // Step 4: Parse the credential response
+        // The response JSON includes a "credential" field with base64-encoded
+        // ExpiringProfileKeyCredentialResponse
+        #[derive(serde::Deserialize)]
+        struct ProfileCredentialResponse {
+            credential: String,
+        }
+
+        let profile_response: ProfileCredentialResponse = response
+            .json()
+            .await
+            .map_err(|e| {
+                error!("failed to parse profile credential response: {e}");
+                Error::ServiceError(e.into())
+            })?;
+
+        let credential_response_bytes = BASE64_STANDARD
+            .decode(&profile_response.credential)
+            .map_err(|e| {
+                error!("failed to base64-decode credential response: {e}");
+                libsignal_service::prelude::ServiceError::GroupsV2Error
+            })?;
+
+        let credential_response: libsignal_service::zkgroup::profiles::ExpiringProfileKeyCredentialResponse =
+            libsignal_service::zkgroup::deserialize(&credential_response_bytes)
+                .map_err(|e| {
+                    error!("failed to deserialize credential response: {e}");
+                    libsignal_service::prelude::ServiceError::GroupsV2Error
+                })?;
+
+        // Step 5: Receive (verify) the credential
+        let current_time = libsignal_service::zkgroup::Timestamp::from_epoch_seconds(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+
+        let credential = server_public_params
+            .receive_expiring_profile_key_credential(
+                &request_context,
+                &credential_response,
+                current_time,
+            )
+            .map_err(|e| {
+                error!("failed to verify expiring profile key credential: {e:?}");
+                libsignal_service::prelude::ServiceError::GroupsV2Error
+            })?;
+
+        // Step 6: Create presentation bound to the group
+        let mut presentation_randomness = [0u8; 32];
+        rand::Rng::fill(&mut rand::rng(), &mut presentation_randomness);
+
+        let presentation = server_public_params
+            .create_expiring_profile_key_credential_presentation(
+                presentation_randomness,
+                group_secret_params,
+                credential,
+            );
+
+        debug!("successfully obtained expiring profile key credential presentation");
+        Ok(presentation)
     }
 }
 

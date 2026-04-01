@@ -1545,10 +1545,20 @@ impl<S: Store> Manager<S, Registered> {
             GroupSecretParams::derive_from_master_key(group_master_key);
 
         // 2. Get group auth credentials
-        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        debug!("create_group: getting groups manager");
+        let mut groups_manager = Box::pin(self.groups_manager()).await.map_err(|e| {
+            error!("create_group: failed to get groups manager: {e:#}");
+            e
+        })?;
+        debug!("create_group: getting authorization for today");
         let authorization = groups_manager
             .get_authorization_for_today(&mut rand::rng(), group_secret_params)
-            .await?;
+            .await
+            .map_err(|e| {
+                error!("create_group: failed to get authorization: {e:#}");
+                e
+            })?;
+        debug!("create_group: got authorization");
 
         // 3. Build the encrypted group protobuf
         let our_aci: Aci = self.state.data.service_ids.aci();
@@ -1557,6 +1567,7 @@ impl<S: Store> Manager<S, Registered> {
         let server_public_params = service_configuration.zkgroup_server_public_params;
 
         // 3a. Obtain ExpiringProfileKeyCredentialPresentation for the creator
+        debug!("create_group: obtaining credential presentation for creator");
         let presentation = self
             .get_expiring_profile_key_credential_presentation(
                 our_aci,
@@ -1564,7 +1575,12 @@ impl<S: Store> Manager<S, Registered> {
                 &server_public_params,
                 group_secret_params,
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                error!("create_group: failed to get credential presentation: {e:#}");
+                e
+            })?;
+        debug!("create_group: got credential presentation ({} bytes)", libsignal_service::zkgroup::serialize(&presentation).len());
         let presentation_bytes = libsignal_service::zkgroup::serialize(&presentation);
 
         // Encrypt the group public key (bincode-serialized GroupPublicParams)

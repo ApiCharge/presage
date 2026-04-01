@@ -1821,6 +1821,37 @@ impl<S: Store> Manager<S, Registered> {
             }
         }
 
+        // 6. Send group update to invited members so their clients discover the group
+        {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let group_context = libsignal_service::proto::GroupContextV2 {
+                master_key: Some(master_key_bytes.to_vec()),
+                revision: Some(0),
+                group_change: None,
+            };
+
+            let data_message = libsignal_service::proto::DataMessage {
+                group_v2: Some(group_context),
+                timestamp: Some(timestamp),
+                ..Default::default()
+            };
+
+            let body = ContentBody::DataMessage(data_message);
+
+            for member_aci in &member_acis {
+                let service_id: ServiceId = (*member_aci).into();
+                info!("sending group invite notification to {}", member_aci.service_id_string());
+                match self.send_message(service_id, body.clone(), timestamp).await {
+                    Ok(()) => debug!("group invite sent to {}", member_aci.service_id_string()),
+                    Err(e) => error!("failed to send group invite to {}: {e:#}", member_aci.service_id_string()),
+                }
+            }
+        }
+
         Ok(master_key_bytes)
     }
 

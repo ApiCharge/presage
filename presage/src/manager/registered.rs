@@ -1855,7 +1855,14 @@ impl<S: Store> Manager<S, Registered> {
             error!("failed to read profile credential response body: {e}");
             Error::ServiceError(e.into())
         })?;
-        debug!("profile credential response body (first 500 chars): {}", &response_text[..response_text.len().min(500)]);
+        debug!("profile credential response length: {} bytes", response_text.len());
+        // Log all JSON field names
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&response_text) {
+            if let Some(obj) = v.as_object() {
+                let keys: Vec<&String> = obj.keys().collect();
+                debug!("profile credential response fields: {:?}", keys);
+            }
+        }
 
         let profile_response: ProfileCredentialResponse = serde_json::from_str(&response_text)
             .map_err(|e| {

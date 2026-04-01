@@ -1868,7 +1868,7 @@ impl<S: Store> Manager<S, Registered> {
         let credential_request_hex = hex::encode(&credential_request_bytes);
 
         let path = format!(
-            "/v1/profile/{}/{}?credentialType=expiringProfileKey&credentialVersion=0&zkc={}",
+            "/v1/profile/{}/{}/{}?credentialType=expiringProfileKey",
             aci.service_id_string(),
             version_str,
             credential_request_hex,

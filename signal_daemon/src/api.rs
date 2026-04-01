@@ -26,6 +26,9 @@ pub struct ReceivedMessage {
     /// TLS-verified envelope material for the new contract flow
     pub verified_envelope: Option<VerifiedEnvelopeDto>,
 
+    /// TEE attestation signature (hex-encoded Ed25519 signature)
+    pub tee_signature: Option<String>,
+
     /// Decrypted message body (for relay to display/respond)
     pub decrypted_body: Option<String>,
 }
@@ -54,17 +57,6 @@ pub struct VerifiedEnvelopeDto {
     pub s_shared: String,         // hex, 32 bytes
     pub message_key: String,      // hex, 32 bytes
     pub pqr_salt: String,         // hex, 32 bytes
-}
-
-/// TLS session setup data sent once per new TLS connection.
-/// The contract verifies the handshake to anchor the session keys.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TlsSessionSetupDto {
-    pub session_id: u64,
-    pub client_hello: String,           // hex, plaintext ClientHello
-    pub server_hello: String,           // hex, plaintext ServerHello
-    pub encrypted_handshake: String,    // hex, encrypted HS records
-    pub client_ephemeral_priv: String,  // hex, 32 bytes (single-use, safe to reveal)
 }
 
 /// Response to GET /receive
@@ -96,8 +88,29 @@ pub struct SendResponse {
     pub error: Option<String>,
 }
 
+/// Request for POST /create-group
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateGroupRequest {
+    pub name: String,
+    pub members: Vec<String>, // UUIDs
+}
+
+/// Response for POST /create-group
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateGroupResponse {
+    pub success: bool,
+    pub group_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Response for GET /tee-pubkey
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TeePubkeyResponse {
+    pub pubkey_hex: String,
+}
+
 /// A detected SenderKeyDistributionMessage event.
-/// The daemon surfaces these so the relay can trigger zkFetch attestation.
+/// The daemon surfaces these so the relay can trigger TEE attestation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkdmEvent {
     /// Hex-encoded raw sealed sender envelope bytes
@@ -106,6 +119,12 @@ pub struct SkdmEvent {
     pub sender: String,
     /// Detection timestamp (millis since epoch)
     pub timestamp: u64,
-    /// zkFetch proof JSON (populated after attestation, None initially)
-    pub zkfetch_proof: Option<serde_json::Value>,
+    /// TEE attestation signature (hex-encoded Ed25519 signature)
+    pub tee_signature: Option<String>,
+    /// Signal protocol pre-computed ECDH values (hex, 32 bytes each).
+    /// Needed by the RISC Zero prover to verify the sealed sender envelope.
+    pub e_shared: String,
+    pub s_shared: String,
+    pub message_key: String,
+    pub pqr_salt: String,
 }

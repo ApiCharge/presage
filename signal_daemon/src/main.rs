@@ -4,22 +4,14 @@
 //! receives sealed sender envelopes, extracts the s-layer cryptographic
 //! material, and exposes it via HTTP for the .NET SignalRelayService.
 //!
-//! Phase 1: Uses presage's receive_messages() for decrypted content.
-//!   The relay submits instructions via admin-auth. Works for testnet.
-//!
-//! Phase 2: Custom WebSocket receiver that captures raw sealed sender
-//!   material for full on-chain verification. Required for MiCA production.
-//!
 //! Architecture:
-//!   Signal servers ↔ presage (WebSocket) ↔ This daemon ↔ HTTP ↔ .NET relay
+//!   Signal servers <-> presage (WebSocket) <-> This daemon <-> HTTP <-> .NET relay
 
 mod api;
 mod config;
 mod message_keys;
 mod receiver;
-mod receiver_parse;
 mod sealed_sender;
-mod tls_poll;
 
 use api::*;
 use std::sync::Arc;
@@ -31,23 +23,30 @@ use axum::{
     Json, Router,
 };
 
+use ed25519_dalek::SigningKey;
+
 /// Outbound send request queued by the HTTP handler, processed by the receiver thread.
 pub struct PendingSend {
     pub recipient: String,
     pub message: String,
 }
 
+/// Group creation request queued by the HTTP handler, processed by the receiver thread.
+pub struct PendingGroupCreate {
+    pub name: String,
+    pub members: Vec<String>,
+    pub response_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+}
+
 pub struct AppState {
     pub message_queue: Vec<ReceivedMessage>,
     pub send_queue: Vec<PendingSend>,
+    pub group_create_queue: Vec<PendingGroupCreate>,
     pub messages_received: u64,
     pub connected: bool,
     pub phone_number: String,
     pub uuid: String,
-    /// TLS session setup for the relay (legacy, may be removed)
-    pub pending_tls_session: Option<api::TlsSessionSetupDto>,
-    /// SKDM events detected — for the new zkFetch flow
-    pub skdm_events: Vec<api::SkdmEvent>,
+    pub tee_signing_key: SigningKey,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -58,10 +57,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    // Install ring as the default CryptoProvider for presage's WebSocket connections
-    // (send_message, etc). Our TLS poll uses a custom provider per-connection.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -99,15 +94,40 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!("Presage store exists at {db_file}, skipping migration.");
     }
 
+    // Load or generate TEE Ed25519 signing key
+    let tee_signing_key = match std::env::var("TEE_SIGNING_KEY") {
+        Ok(hex_key) => {
+            let bytes = hex::decode(&hex_key)
+                .map_err(|e| anyhow::anyhow!("TEE_SIGNING_KEY invalid hex: {e}"))?;
+            let secret: [u8; 32] = bytes
+                .try_into()
+                .map_err(|v: Vec<u8>| anyhow::anyhow!("TEE_SIGNING_KEY must be 32 bytes (64 hex chars), got {}", v.len()))?;
+            let key = SigningKey::from_bytes(&secret);
+            tracing::info!(
+                "TEE signing key loaded from env, pubkey={}",
+                hex::encode(key.verifying_key().as_bytes())
+            );
+            key
+        }
+        Err(_) => {
+            let key = SigningKey::generate(&mut rand::rngs::OsRng);
+            tracing::warn!(
+                "TEE_SIGNING_KEY not set — using ephemeral key for development. pubkey={}",
+                hex::encode(key.verifying_key().as_bytes())
+            );
+            key
+        }
+    };
+
     let state: SharedState = Arc::new(Mutex::new(AppState {
         message_queue: Vec::new(),
         send_queue: Vec::new(),
+        group_create_queue: Vec::new(),
         messages_received: 0,
         connected: false,
         phone_number: daemon_config.phone_number.clone(),
         uuid: daemon_config.uuid.clone(),
-        pending_tls_session: None,
-        skdm_events: Vec::new(),
+        tee_signing_key,
     }));
 
     // Run the receiver on a dedicated OS thread (presage futures are huge in debug)
@@ -164,8 +184,8 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/receive", get(handle_receive))
         .route("/send", post(handle_send))
         .route("/status", get(handle_status))
-        .route("/tls-session", get(handle_tls_session))
-        .route("/skdm-events", get(handle_skdm_events))
+        .route("/create-group", post(handle_create_group))
+        .route("/tee-pubkey", get(handle_tee_pubkey))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -209,17 +229,63 @@ async fn handle_status(State(state): State<SharedState>) -> Json<StatusResponse>
     })
 }
 
-/// GET /tls-session — retrieve the latest TLS session setup data.
-/// The .NET relay calls this once per TLS session, then submits to the contract's verify_tls_session.
-async fn handle_tls_session(State(state): State<SharedState>) -> Json<Option<api::TlsSessionSetupDto>> {
-    let mut s = state.lock().await;
-    Json(s.pending_tls_session.take())
+async fn handle_create_group(
+    State(state): State<SharedState>,
+    Json(req): Json<CreateGroupRequest>,
+) -> Json<CreateGroupResponse> {
+    tracing::info!(
+        "create-group called for '{}' with {} members",
+        req.name,
+        req.members.len(),
+    );
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    {
+        let mut s = state.lock().await;
+        if !s.connected {
+            return Json(CreateGroupResponse {
+                success: false,
+                group_id: None,
+                error: Some("Not connected to Signal".into()),
+            });
+        }
+        s.group_create_queue.push(PendingGroupCreate {
+            name: req.name,
+            members: req.members,
+            response_tx: tx,
+        });
+    }
+
+    // Wait for the receiver thread to process the group creation
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(Ok(group_id))) => Json(CreateGroupResponse {
+            success: true,
+            group_id: Some(group_id),
+            error: None,
+        }),
+        Ok(Ok(Err(err))) => Json(CreateGroupResponse {
+            success: false,
+            group_id: None,
+            error: Some(err),
+        }),
+        Ok(Err(_)) => Json(CreateGroupResponse {
+            success: false,
+            group_id: None,
+            error: Some("Internal error: response channel closed".into()),
+        }),
+        Err(_) => Json(CreateGroupResponse {
+            success: false,
+            group_id: None,
+            error: Some("Timeout waiting for group creation (30s)".into()),
+        }),
+    }
 }
 
-/// GET /skdm-events — retrieve detected SKDM events with zkFetch proofs.
-async fn handle_skdm_events(State(state): State<SharedState>) -> Json<Vec<api::SkdmEvent>> {
-    let mut s = state.lock().await;
-    Json(std::mem::take(&mut s.skdm_events))
+async fn handle_tee_pubkey(State(state): State<SharedState>) -> Json<TeePubkeyResponse> {
+    let s = state.lock().await;
+    let pubkey_hex = hex::encode(s.tee_signing_key.verifying_key().as_bytes());
+    Json(TeePubkeyResponse { pubkey_hex })
 }
 
 /// Create a presage-compatible SQLite store from signal-cli credentials.

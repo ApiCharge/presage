@@ -1,28 +1,18 @@
-//! Message receiver implementing the peek → classify → selective ACK → zkFetch flow.
+//! Message receiver — simple WebSocket receive loop via presage.
 //!
-//! Manager flow:
-//!   1. Peek: GET /v1/messages/ (non-destructive)
-//!   2. Classify: decrypt_envelope() each message locally (no ACK, no WS)
-//!      - Finds SKDM position (if any) and classifies all messages
-//!   3. If no SKDM: open WS, consume all N messages (ACKs them), close
-//!   4. If SKDM at position K:
-//!      a. Open WS, consume K messages before SKDM (ACKs them), close
-//!      b. zkFetch GET /v1/messages/ (SKDM now at front of queue)
-//!      c. Open WS, consume remaining including SKDM (ACKs them), close
-//!   5. Normal messages → relay. SKDM + zkFetch proof → new flow.
-//!
-//! WS decrypt will fail on already-classified messages (Double Ratchet advanced)
-//! but ACK still happens — ACK is sent before decrypt in presage's message pipe.
+//! Connects to Signal via presage's `receive_messages()` stream,
+//! decrypts incoming envelopes, and forwards them to the HTTP API queue.
 
-use crate::api::{ReceivedMessage, SkdmEvent};
+use crate::api::ReceivedMessage;
 use crate::config::DaemonConfig;
 
+use ed25519_dalek::Signer;
 use futures::StreamExt;
 use presage::libsignal_service::content::{Content, ContentBody};
 use presage::libsignal_service::prelude::Uuid;
-use presage::libsignal_service::protocol::ServiceId;
+use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::model::identity::OnNewIdentity;
-use presage::model::messages::{DecryptResult, Received};
+use presage::model::messages::Received;
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 
@@ -39,346 +29,104 @@ pub async fn create_manager(
     Ok(manager)
 }
 
-/// Classified message from the peek-decrypt step.
-enum Classified {
-    /// Normal 1-to-1 or group message with decrypted content.
-    Normal(Content),
-    /// SenderKeyDistributionMessage — content was consumed by libsignal.
-    Skdm,
-    /// Empty envelope or decrypt error — skip.
-    Skip,
-}
-
-/// Main receive loop: peek → classify → selective ACK → zkFetch when needed.
+/// Main receive loop: listens on WebSocket via presage, processes sends on a timer.
 pub async fn run_receive_loop(
     manager: &mut Manager<SqliteStore, presage::manager::Registered>,
-    message_queue: Arc<Mutex<Vec<ReceivedMessage>>>,
-    config: &DaemonConfig,
+    _message_queue: Arc<Mutex<Vec<ReceivedMessage>>>,
+    _config: &DaemonConfig,
     app_state: Arc<Mutex<crate::AppState>>,
 ) -> anyhow::Result<()> {
-    tracing::info!("Starting peek-classify-ACK receive loop");
+    tracing::info!("Starting WebSocket receive loop");
 
     let mut send_interval = tokio::time::interval(std::time::Duration::from_secs(2));
-    let mut peek_interval = tokio::time::interval(std::time::Duration::from_secs(3));
+
+    let stream = manager.receive_messages().await?;
+    futures::pin_mut!(stream);
 
     loop {
         tokio::select! {
             _ = send_interval.tick() => {
                 process_pending_sends(manager, &app_state).await;
+                process_pending_group_creates(manager, &app_state).await;
             }
 
-            _ = peek_interval.tick() => {
-                if let Err(e) = peek_classify_ack(manager, config, &app_state).await {
-                    tracing::warn!("Peek-classify-ACK error: {e:#}");
+            item = stream.next() => {
+                match item {
+                    Some(Received::Content { content, .. }) => {
+                        handle_content(*content, &app_state).await;
+                    }
+                    Some(Received::SenderKeyDistribution { sender, .. }) => {
+                        tracing::info!("SenderKeyDistribution from {sender}");
+                    }
+                    Some(Received::QueueEmpty) => {
+                        tracing::debug!("WebSocket queue empty");
+                    }
+                    Some(Received::Contacts) => {
+                        tracing::debug!("Contacts sync received");
+                    }
+                    None => {
+                        tracing::info!("WebSocket stream ended");
+                        return Ok(());
+                    }
                 }
             }
         }
     }
 }
 
-/// The main manager orchestration: peek, classify, selectively ACK, zkFetch if needed.
-async fn peek_classify_ack(
-    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
-    config: &DaemonConfig,
-    app_state: &Arc<Mutex<crate::AppState>>,
-) -> anyhow::Result<()> {
-    // ── Step 1: Peek ──────────────────────────────────────────────────
-    let peek_body = peek_message_queue(config).await?;
-    let envelopes = crate::receiver_parse::parse_envelopes_from_json(&peek_body);
+async fn handle_content(content: Content, app_state: &Arc<Mutex<crate::AppState>>) {
+    let sender_uuid = content.metadata.sender.raw_uuid().to_string();
+    let body = extract_body_text(&content);
 
-    if envelopes.is_empty() {
-        return Ok(());
-    }
+    let is_group = matches!(
+        &content.body,
+        ContentBody::DataMessage(dm) if dm.group_v2.is_some()
+    );
 
-    let count = envelopes.len();
-    tracing::info!("Peek: {count} envelope(s) in queue");
-
-    // ── Step 2: Classify via decrypt_envelope (no WS, no ACK) ─────────
-    let our_uuid = manager.registration_data().service_ids.aci.to_string();
-    let mut classified: Vec<Classified> = Vec::with_capacity(count);
-    let mut skdm_position: Option<usize> = None;
-
-    for (idx, env) in envelopes.iter().enumerate() {
-        if env.content_b64.is_empty() || env.msg_type != 6 {
-            classified.push(Classified::Skip);
-            continue;
-        }
-
-        let content_bytes = match base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &env.content_b64,
-        ) {
-            Ok(b) => b,
-            Err(_) => {
-                classified.push(Classified::Skip);
-                continue;
-            }
-        };
-
-        let envelope = presage::libsignal_service::envelope::Envelope {
-            r#type: Some(6), // UNIDENTIFIED_SENDER
-            content: Some(content_bytes),
-            timestamp: Some(env.timestamp),
-            server_timestamp: Some(env.server_timestamp),
-            destination_service_id: Some(our_uuid.clone()),
-            ..Default::default()
-        };
-
-        match manager.decrypt_envelope(envelope).await {
-            Ok(DecryptResult::Content(content, _mk, _pqr)) => {
-                classified.push(Classified::Normal(content));
-            }
-            Ok(DecryptResult::Skdm) => {
-                if skdm_position.is_none() {
-                    skdm_position = Some(idx);
-                }
-                classified.push(Classified::Skdm);
-                tracing::info!("SKDM detected at queue position {idx}");
-            }
-            Ok(DecryptResult::Empty) => {
-                classified.push(Classified::Skip);
-            }
-            Err(e) => {
-                tracing::debug!("Classify: envelope {idx} decrypt error: {e}");
-                classified.push(Classified::Skip);
-            }
-        }
-    }
-
-    // ── Step 3: Selective ACK via WebSocket ────────────────────────────
-    if let Some(k) = skdm_position {
-        // 3a. ACK messages before the SKDM
-        if k > 0 {
-            tracing::info!("ACKing {k} messages before SKDM");
-            consume_ws_messages(manager, k).await;
-        }
-
-        // 3b. zkFetch the GET (SKDM is now at front of queue)
-        tracing::info!("Calling zkFetch sidecar (SKDM at front of queue)");
-        let proof = call_zkfetch_sidecar(config).await;
-        match &proof {
-            Ok(p) => tracing::info!("zkFetch proof obtained ({} bytes)", p.to_string().len()),
-            Err(e) => tracing::warn!("zkFetch failed: {e:#}"),
-        }
-
-        // 3c. ACK remaining messages including the SKDM
-        let remaining = count - k;
-        tracing::info!("ACKing remaining {remaining} messages (including SKDM)");
-        consume_ws_messages(manager, remaining).await;
-
-        // Store SKDM event
-        {
-            let mut s = app_state.lock().await;
-            s.skdm_events.push(SkdmEvent {
-                raw_envelope: String::new(), // TODO: capture from peek
-                sender: String::new(),
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-                zkfetch_proof: proof.ok(),
-            });
-        }
-    } else {
-        // No SKDM — ACK everything
-        tracing::debug!("No SKDM, ACKing all {count} messages");
-        consume_ws_messages(manager, count).await;
-    }
-
-    // ── Step 4: Forward classified messages ────────────────────────────
-    let mut normal_count = 0u32;
-    let mut group_count = 0u32;
-    let mut skdm_count = 0u32;
-
-    for msg in classified {
-        match msg {
-            Classified::Normal(content) => {
-                let sender_uuid = content.metadata.sender.raw_uuid().to_string();
-                let body = extract_body_text(&content);
-
-                let is_group = matches!(&content.body,
-                    ContentBody::DataMessage(dm) if dm.group_v2.is_some()
-                );
-
-                if is_group {
-                    group_count += 1;
-                    tracing::info!(
-                        "Group message from {}: {} [null bin]",
-                        sender_uuid,
-                        body.as_deref().unwrap_or("<non-text>"),
-                    );
-                    // SenderKey group messages → null bin for now
-                } else {
-                    normal_count += 1;
-                    tracing::info!(
-                        "Message from {}: {}",
-                        sender_uuid,
-                        body.as_deref().unwrap_or("<non-text>"),
-                    );
-
-                    let msg = ReceivedMessage {
-                        sender_uuid,
-                        sender_phone: None,
-                        sender_identity_key: None,
-                        timestamp: content.metadata.timestamp,
-                        sealed_envelope: Default::default(),
-                        verified_envelope: None,
-                        decrypted_body: body,
-                    };
-
-                    let mut s = app_state.lock().await;
-                    s.message_queue.push(msg);
-                    s.messages_received += 1;
-                }
-            }
-            Classified::Skdm => {
-                skdm_count += 1;
-            }
-            Classified::Skip => {}
-        }
-    }
-
-    if normal_count + group_count + skdm_count > 0 {
+    if is_group {
         tracing::info!(
-            "Processed: {normal_count} normal, {group_count} group (null bin), {skdm_count} SKDM"
+            "Group message from {}: {}",
+            sender_uuid,
+            body.as_deref().unwrap_or("<non-text>"),
         );
-    }
+        // SenderKey group messages — not relayed for now
+    } else {
+        tracing::info!(
+            "Message from {}: {}",
+            sender_uuid,
+            body.as_deref().unwrap_or("<non-text>"),
+        );
 
-    Ok(())
-}
+        let mut msg = ReceivedMessage {
+            sender_uuid,
+            sender_phone: None,
+            sender_identity_key: None,
+            timestamp: content.metadata.timestamp,
+            sealed_envelope: Default::default(),
+            verified_envelope: None,
+            tee_signature: None,
+            decrypted_body: body,
+        };
 
-/// Open WebSocket, consume exactly `count` messages (ACKing each), then close.
-/// The WS ACKs happen before decryption in presage's message pipe, so even if
-/// decrypt fails (because we already decrypted in the classify step), ACK succeeds.
-async fn consume_ws_messages(
-    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
-    count: usize,
-) {
-    if count == 0 {
-        return;
-    }
-
-    match manager.receive_messages().await {
-        Ok(stream) => {
-            futures::pin_mut!(stream);
-            let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
-            tokio::pin!(timeout);
-
-            let mut consumed = 0usize;
-            loop {
-                if consumed >= count {
-                    break;
-                }
-                tokio::select! {
-                    item = stream.next() => {
-                        match item {
-                            Some(Received::QueueEmpty) | None => break,
-                            Some(_) => { consumed += 1; }
-                        }
-                    }
-                    _ = &mut timeout => {
-                        tracing::debug!("WS consume timeout after {consumed}/{count}");
-                        break;
-                    }
-                }
+        // Sign the message with the TEE key.
+        // We sign: sender_uuid || timestamp (big-endian 8 bytes) || body bytes
+        // This binds the attestation to the specific message content.
+        {
+            let s = app_state.lock().await;
+            let mut sign_data = Vec::new();
+            sign_data.extend_from_slice(msg.sender_uuid.as_bytes());
+            sign_data.extend_from_slice(&msg.timestamp.to_be_bytes());
+            if let Some(ref body) = msg.decrypted_body {
+                sign_data.extend_from_slice(body.as_bytes());
             }
-            tracing::debug!("WS consumed {consumed}/{count} messages");
-            // Stream dropped here — WS closes, remaining messages stay in queue
+            let signature = s.tee_signing_key.sign(&sign_data);
+            msg.tee_signature = Some(hex::encode(signature.to_bytes()));
         }
-        Err(e) => {
-            tracing::warn!("WS consume failed: {e}");
-        }
+
+        let mut s = app_state.lock().await;
+        s.message_queue.push(msg);
+        s.messages_received += 1;
     }
-}
-
-/// Call the zkFetch sidecar to get a proof of Signal's GET /v1/messages/ response.
-async fn call_zkfetch_sidecar(config: &DaemonConfig) -> anyhow::Result<serde_json::Value> {
-    let sidecar_url = std::env::var("ZKFETCH_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:7585".to_string());
-
-    let auth = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        format!("{}:{}", config.uuid, config.password),
-    );
-
-    let signal_url = format!("https://{}/v1/messages/", config.signal_host);
-
-    let request_body = serde_json::json!({
-        "url": signal_url,
-        "publicOptions": {
-            "method": "GET",
-        },
-        "privateOptions": {
-            "headers": {
-                "Authorization": format!("Basic {auth}")
-            }
-        }
-    });
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{sidecar_url}/zkfetch"))
-        .json(&request_body)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("zkFetch sidecar returned {status}: {body}");
-    }
-
-    let result: serde_json::Value = response.json().await?;
-    Ok(result.get("proof").cloned().unwrap_or(result))
-}
-
-/// Peek Signal's message queue via plain HTTPS GET.
-async fn peek_message_queue(config: &DaemonConfig) -> anyhow::Result<Vec<u8>> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let der = include_bytes!("signal_root_ca.der");
-    root_store
-        .add(rustls::pki_types::CertificateDer::from(&der[..]))
-        .expect("Signal root CA is valid");
-
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
-    let host = &config.signal_host;
-    let server_name = rustls::pki_types::ServerName::try_from(host.clone())?;
-
-    let tcp = tokio::net::TcpStream::connect(format!("{host}:443")).await?;
-    let mut tls = connector.connect(server_name, tcp).await?;
-
-    let auth = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        format!("{}:{}", config.uuid, config.password),
-    );
-    let request = format!(
-        "GET /v1/messages/ HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         Authorization: Basic {auth}\r\n\
-         Connection: close\r\n\
-         \r\n",
-    );
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    tls.write_all(request.as_bytes()).await?;
-    tls.flush().await?;
-
-    let mut response = Vec::new();
-    tls.read_to_end(&mut response).await?;
-
-    let body_start = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-        .unwrap_or(0);
-
-    Ok(response[body_start..].to_vec())
 }
 
 async fn process_pending_sends(
@@ -414,6 +162,52 @@ async fn process_pending_sends(
         match manager.send_message(service_id, body, timestamp).await {
             Ok(()) => tracing::info!("Sent successfully to {}", send.recipient),
             Err(e) => tracing::error!("Send failed to {}: {e:#}", send.recipient),
+        }
+    }
+}
+
+async fn process_pending_group_creates(
+    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
+    app_state: &Arc<Mutex<crate::AppState>>,
+) {
+    let creates: Vec<crate::PendingGroupCreate> = {
+        let mut s = app_state.lock().await;
+        std::mem::take(&mut s.group_create_queue)
+    };
+
+    for create in creates {
+        tracing::info!("Creating group '{}' with {} members", create.name, create.members.len());
+
+        // Parse member UUIDs to ACIs
+        let mut member_acis = Vec::new();
+        let mut parse_error = None;
+        for member_str in &create.members {
+            match member_str.parse::<Uuid>() {
+                Ok(uuid) => member_acis.push(Aci::from(uuid)),
+                Err(e) => {
+                    parse_error = Some(format!("Invalid member UUID '{}': {}", member_str, e));
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = parse_error {
+            tracing::error!("{err}");
+            let _ = create.response_tx.send(Err(err));
+            continue;
+        }
+
+        match manager.create_group(&create.name, member_acis).await {
+            Ok(master_key_bytes) => {
+                let group_id = hex::encode(master_key_bytes);
+                tracing::info!("Group '{}' created, id={}", create.name, group_id);
+                let _ = create.response_tx.send(Ok(group_id));
+            }
+            Err(e) => {
+                let err_msg = format!("Failed to create group: {e:#}");
+                tracing::error!("{err_msg}");
+                let _ = create.response_tx.send(Err(err_msg));
+            }
         }
     }
 }

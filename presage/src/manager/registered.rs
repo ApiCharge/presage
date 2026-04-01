@@ -6,7 +6,7 @@ use futures::{future, AsyncReadExt, Stream, StreamExt};
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
     cipher,
-    configuration::{ServiceConfiguration, SignalServers},
+    configuration::{Endpoint, ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, DataMessageFlags, Metadata},
     encrypt_device_name,
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
@@ -23,7 +23,7 @@ use libsignal_service::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
-    push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
+    push_service::{HttpAuthOverride, PushService, ServiceIds, DEFAULT_DEVICE_ID},
     receiver::MessageReceiver,
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
@@ -36,11 +36,13 @@ use libsignal_service::{
     },
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
+        GroupMasterKeyBytes,
         profiles::ProfileKey,
     },
     AccountManager, Profile, ServiceIdExt,
 };
 use rand::rng;
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::sync::Mutex;
@@ -1513,6 +1515,217 @@ impl<S: Store> Manager<S, Registered> {
         );
 
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
+    }
+
+    /// Creates a new Signal GroupV2 with the given title and member ACIs.
+    ///
+    /// The group is created on Signal's storage service with the caller as
+    /// the sole ADMINISTRATOR member. Other members specified in
+    /// `member_acis` are added as pending members (invited). This avoids
+    /// the need for profile key credential presentations, which require
+    /// server round-trips not yet implemented in presage.
+    ///
+    /// Returns the 32-byte group master key which uniquely identifies the
+    /// group and is needed for all subsequent group operations.
+    pub async fn create_group(
+        &mut self,
+        title: &str,
+        member_acis: Vec<Aci>,
+    ) -> Result<GroupMasterKeyBytes, Error<S::Error>> {
+        // 1. Generate random group master key and derive secret params
+        let mut randomness = [0u8; 32];
+        rand::Rng::fill(&mut rand::rng(), &mut randomness);
+        let master_key_bytes: GroupMasterKeyBytes = randomness;
+        let group_master_key = GroupMasterKey::new(master_key_bytes);
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(group_master_key);
+
+        // 2. Get group auth credentials
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let authorization = groups_manager
+            .get_authorization_for_today(&mut rand::rng(), group_secret_params)
+            .await?;
+
+        // 3. Build the encrypted group protobuf
+        let our_aci: Aci = self.state.data.service_ids.aci();
+        let our_profile_key: ProfileKey = self.state.data.profile_key;
+
+        // Encrypt the group public key (bincode-serialized GroupPublicParams)
+        let group_public_params = group_secret_params.get_public_params();
+        let public_key = bincode::serialize(&group_public_params)
+            .map_err(|e| {
+                error!("failed to serialize group public params: {e}");
+                libsignal_service::prelude::ServiceError::GroupsV2Error
+            })?;
+
+        // Encrypt the title as a GroupAttributeBlob
+        let title_blob = libsignal_service::proto::GroupAttributeBlob {
+            content: Some(
+                libsignal_service::proto::group_attribute_blob::Content::Title(
+                    title.to_string(),
+                ),
+            ),
+        };
+        let mut title_plaintext = Vec::new();
+        title_blob.encode(&mut title_plaintext)
+            .map_err(|_| libsignal_service::prelude::ServiceError::GroupsV2Error)?;
+        // encrypt_blob_with_padding prepends a 4-byte padding length
+        let mut title_randomness = [0u8; 32];
+        rand::Rng::fill(&mut rand::rng(), &mut title_randomness);
+        let encrypted_title =
+            group_secret_params.encrypt_blob_with_padding(title_randomness, &title_plaintext, 0);
+
+        // Encrypt our own member entry
+        let encrypted_user_id =
+            bincode::serialize(&group_secret_params.encrypt_service_id(our_aci.into()))
+                .map_err(|e| {
+                    error!("failed to serialize encrypted user id: {e}");
+                    libsignal_service::prelude::ServiceError::GroupsV2Error
+                })?;
+        let encrypted_profile_key =
+            bincode::serialize(&group_secret_params.encrypt_profile_key(our_profile_key, our_aci))
+                .map_err(|e| {
+                    error!("failed to serialize encrypted profile key: {e}");
+                    libsignal_service::prelude::ServiceError::GroupsV2Error
+                })?;
+
+        let creator_member = libsignal_service::proto::Member {
+            user_id: encrypted_user_id,
+            role: libsignal_service::proto::member::Role::Administrator.into(),
+            profile_key: encrypted_profile_key,
+            presentation: vec![], // TODO: presentation requires ExpiringProfileKeyCredential flow
+            joined_at_revision: 0,
+        };
+
+        // Build pending members for invited ACIs
+        let mut pending_members = Vec::new();
+        let encrypted_creator_id =
+            bincode::serialize(&group_secret_params.encrypt_service_id(our_aci.into()))
+                .map_err(|e| {
+                    error!("failed to serialize creator id for pending member: {e}");
+                    libsignal_service::prelude::ServiceError::GroupsV2Error
+                })?;
+
+        for member_aci in &member_acis {
+            let encrypted_member_id =
+                bincode::serialize(&group_secret_params.encrypt_service_id((*member_aci).into()))
+                    .map_err(|e| {
+                        error!("failed to serialize encrypted member id: {e}");
+                        libsignal_service::prelude::ServiceError::GroupsV2Error
+                    })?;
+
+            let pending_member = libsignal_service::proto::PendingMember {
+                member: Some(libsignal_service::proto::Member {
+                    user_id: encrypted_member_id,
+                    role: libsignal_service::proto::member::Role::Default.into(),
+                    profile_key: vec![],
+                    presentation: vec![],
+                    joined_at_revision: 0,
+                }),
+                added_by_user_id: encrypted_creator_id.clone(),
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            };
+            pending_members.push(pending_member);
+        }
+
+        // Access control: members can see attributes and member list,
+        // only admins can add new members
+        let access_control = libsignal_service::proto::AccessControl {
+            attributes: libsignal_service::proto::access_control::AccessRequired::Member.into(),
+            members: libsignal_service::proto::access_control::AccessRequired::Member.into(),
+            add_from_invite_link: libsignal_service::proto::access_control::AccessRequired::Unsatisfiable.into(),
+        };
+
+        let encrypted_group = libsignal_service::proto::Group {
+            public_key,
+            title: encrypted_title,
+            avatar: String::new(),
+            disappearing_messages_timer: vec![],
+            access_control: Some(access_control),
+            revision: 0,
+            members: vec![creator_member],
+            pending_members,
+            requesting_members: vec![],
+            invite_link_password: vec![],
+            description: vec![],
+            announcements_only: false,
+            banned_members: vec![],
+        };
+
+        // 4. PUT the group to the storage service
+        let mut body_bytes = Vec::new();
+        encrypted_group.encode(&mut body_bytes)
+            .map_err(|_| libsignal_service::prelude::ServiceError::GroupsV2Error)?;
+
+        let push_service = self.identified_push_service();
+        let response = push_service
+            .request(
+                Method::PUT,
+                Endpoint::storage("/v1/groups/"),
+                HttpAuthOverride::Identified(authorization),
+            )?
+            .header("Content-Type", "application/x-protobuf")
+            .body(body_bytes)
+            .send()
+            .await
+            .map_err(|e| Error::ServiceError(e.into()))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            error!(
+                status = %status,
+                body = %body,
+                "failed to create group on server"
+            );
+            return Err(libsignal_service::prelude::ServiceError::GroupsV2Error.into());
+        }
+
+        info!(group_title = %title, "group created on server");
+
+        // 5. Fetch the group back from the server to get the canonical state,
+        //    then store it locally
+        match groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), &master_key_bytes)
+            .await
+        {
+            Ok(fetched_encrypted_group) => {
+                let group = decrypt_group(&master_key_bytes, fetched_encrypted_group)?;
+                debug!(group_title = %group.title, members = group.members.len(), "fetched created group");
+                if let Err(e) = self.store.save_group(master_key_bytes, group).await {
+                    error!("failed to save group locally: {e}");
+                }
+            }
+            Err(e) => {
+                warn!("failed to fetch back created group: {e}, storing minimal local copy");
+                // Store a minimal local representation so we can still reference the group
+                let local_group = Group {
+                    title: title.to_string(),
+                    avatar: String::new(),
+                    disappearing_messages_timer: None,
+                    access_control: None,
+                    revision: 0,
+                    members: vec![crate::model::groups::Member {
+                        aci: our_aci,
+                        role: libsignal_service::groups_v2::Role::Administrator,
+                        profile_key: our_profile_key,
+                        joined_at_revision: 0,
+                    }],
+                    pending_members: vec![],
+                    requesting_members: vec![],
+                    invite_link_password: vec![],
+                    description: None,
+                };
+                if let Err(e) = self.store.save_group(master_key_bytes, local_group).await {
+                    error!("failed to save minimal group locally: {e}");
+                }
+            }
+        }
+
+        Ok(master_key_bytes)
     }
 }
 

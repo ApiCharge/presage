@@ -37,14 +37,6 @@ hkdf = "0.12"
 aes = "0.8"
 ctr = "0.9"
 
-# TLS record capture for on-chain verification
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
-tokio-rustls = "0.26"
-webpki-roots = "0.26"
-
-# X25519 ephemeral key capture — StaticSecret exposes to_bytes(), unlike ring's opaque type
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-rand_core = "0.6"
-
-# HTTP client for zkFetch sidecar calls
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Ed25519 signing for TEE attestation
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"

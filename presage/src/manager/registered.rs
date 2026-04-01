@@ -1566,7 +1566,69 @@ impl<S: Store> Manager<S, Registered> {
         let service_configuration = self.state.service_configuration();
         let server_public_params = service_configuration.zkgroup_server_public_params;
 
-        // 3a. Obtain ExpiringProfileKeyCredentialPresentation for the creator
+        // 3a. Ensure profile is uploaded (required for credential issuance)
+        debug!("create_group: uploading versioned profile to ensure credential availability");
+        {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+
+            let profile_key_version = our_profile_key.get_profile_key_version(our_aci);
+            let version = bincode::serialize(&profile_key_version)
+                .map_err(|e| {
+                    error!("failed to serialize profile key version: {e}");
+                    libsignal_service::prelude::ServiceError::GroupsV2Error
+                })?;
+            let version_str = std::str::from_utf8(&version)
+                .expect("hex encoded profile key version");
+            let commitment = our_profile_key.get_commitment(our_aci);
+            let commitment_bytes = bincode::serialize(&commitment)
+                .map_err(|e| {
+                    error!("failed to serialize profile key commitment: {e}");
+                    libsignal_service::prelude::ServiceError::GroupsV2Error
+                })?;
+
+            // Encrypt a minimal profile name
+            let profile_cipher = libsignal_service::profile_cipher::ProfileCipher::new(our_profile_key);
+            let profile_name = libsignal_service::profile_name::ProfileName { given_name: "ApiCharge Relay", family_name: None };
+            let encrypted_name = profile_cipher.encrypt_name(&profile_name, &mut rand::rng())
+                .map_err(|_| libsignal_service::prelude::ServiceError::GroupsV2Error)?;
+            let name_b64 = b64.encode(&encrypted_name);
+
+            let push_service = self.identified_push_service();
+            let profile_payload = serde_json::json!({
+                "version": version_str,
+                "name": name_b64,
+                "aboutEmoji": null,
+                "about": null,
+                "paymentAddress": null,
+                "avatar": false,
+                "commitment": b64.encode(&commitment_bytes),
+            });
+
+            let response = push_service
+                .request(
+                    Method::PUT,
+                    Endpoint::service("/v1/profile"),
+                    HttpAuthOverride::NoOverride,
+                )?
+                .header("Content-Type", "application/json")
+                .body(serde_json::to_vec(&profile_payload).unwrap())
+                .send()
+                .await
+                .map_err(|e| {
+                    error!("failed to upload profile: {e}");
+                    Error::ServiceError(e.into())
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                error!(status_code = %status.as_u16(), body = %body, "profile upload failed");
+            } else {
+                debug!("create_group: profile uploaded successfully");
+            }
+        }
+
+        // 3b. Obtain ExpiringProfileKeyCredentialPresentation for the creator
         debug!("create_group: obtaining credential presentation for creator");
         let presentation = self
             .get_expiring_profile_key_credential_presentation(

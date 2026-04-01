@@ -31,6 +31,9 @@ pub struct ReceivedMessage {
 
     /// Decrypted message body (for relay to display/respond)
     pub decrypted_body: Option<String>,
+
+    /// Group ID (hex-encoded master key) if this is a group message
+    pub group_id: Option<String>,
 }
 
 /// The fields needed by the Soroban contract's SealedEnvelope.

@@ -82,20 +82,30 @@ async fn handle_content(content: Content, app_state: &Arc<Mutex<crate::AppState>
         ContentBody::DataMessage(dm) if dm.group_v2.is_some()
     );
 
+    // Extract group_id if this is a group message
+    let group_id = if let ContentBody::DataMessage(dm) = &content.body {
+        dm.group_v2.as_ref().and_then(|g| {
+            g.master_key.as_ref().map(|k| hex::encode(k))
+        })
+    } else {
+        None
+    };
+
     if is_group {
         tracing::info!(
             "Group message from {}: {}",
             sender_uuid,
             body.as_deref().unwrap_or("<non-text>"),
         );
-        // SenderKey group messages — not relayed for now
     } else {
         tracing::info!(
             "Message from {}: {}",
             sender_uuid,
             body.as_deref().unwrap_or("<non-text>"),
         );
+    }
 
+    {
         let mut msg = ReceivedMessage {
             sender_uuid,
             sender_phone: None,
@@ -105,6 +115,7 @@ async fn handle_content(content: Content, app_state: &Arc<Mutex<crate::AppState>
             verified_envelope: None,
             tee_signature: None,
             decrypted_body: body,
+            group_id,
         };
 
         // Sign the message with the TEE key.

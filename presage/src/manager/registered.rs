@@ -1849,12 +1849,16 @@ impl<S: Store> Manager<S, Registered> {
             credential: String,
         }
 
-        let profile_response: ProfileCredentialResponse = response
-            .json()
-            .await
+        let response_text = response.text().await.map_err(|e| {
+            error!("failed to read profile credential response body: {e}");
+            Error::ServiceError(e.into())
+        })?;
+        debug!("profile credential response body (first 500 chars): {}", &response_text[..response_text.len().min(500)]);
+
+        let profile_response: ProfileCredentialResponse = serde_json::from_str(&response_text)
             .map_err(|e| {
-                error!("failed to parse profile credential response: {e}");
-                Error::ServiceError(e.into())
+                error!("failed to parse profile credential response JSON: {e}");
+                Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error)
             })?;
 
         let credential_response_bytes = BASE64_STANDARD

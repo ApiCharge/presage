@@ -47,6 +47,7 @@ pub async fn run_receive_loop(
                 process_pending_sends(manager, &app_state).await;
                 process_pending_group_sends(manager, &app_state).await;
                 process_pending_group_creates(manager, &app_state).await;
+                process_pending_typing(manager, &app_state).await;
             }
 
             item = stream.next() => {
@@ -88,6 +89,8 @@ pub async fn run_receive_loop(
                                 group_id: None,
                                 is_skdm: true,
                                 skdm_signing_key: Some(sk_hex),
+                                is_member_joined: false,
+                                joined_member_uuid: None,
                             };
 
                             let mut s = app_state.lock().await;
@@ -129,6 +132,23 @@ async fn handle_content(content: Content, app_state: &Arc<Mutex<crate::AppState>
         None
     };
 
+    // Detect group member acceptance (group_change present and non-empty)
+    let is_member_joined = if let ContentBody::DataMessage(dm) = &content.body {
+        dm.group_v2.as_ref().map_or(false, |g| {
+            g.group_change.as_ref().map_or(false, |c| !c.is_empty())
+        })
+    } else {
+        false
+    };
+
+    if is_member_joined {
+        tracing::info!(
+            "Group member change detected from {} in group {:?}",
+            sender_uuid,
+            group_id,
+        );
+    }
+
     if is_group {
         tracing::info!(
             "Group message from {}: {}",
@@ -156,6 +176,8 @@ async fn handle_content(content: Content, app_state: &Arc<Mutex<crate::AppState>
             group_id,
             is_skdm: false,
             skdm_signing_key: None,
+            is_member_joined,
+            joined_member_uuid: None,
         };
 
         // Sign the message with the TEE key.
@@ -295,6 +317,72 @@ async fn process_pending_group_creates(
                 let err_msg = format!("Failed to create group: {e:#}");
                 tracing::error!("{err_msg}");
                 let _ = create.response_tx.send(Err(err_msg));
+            }
+        }
+    }
+}
+
+async fn process_pending_typing(
+    manager: &mut Manager<SqliteStore, presage::manager::Registered>,
+    app_state: &Arc<Mutex<crate::AppState>>,
+) {
+    let typings: Vec<crate::PendingTyping> = {
+        let mut s = app_state.lock().await;
+        std::mem::take(&mut s.typing_queue)
+    };
+
+    for typing in typings {
+        let action = if typing.started {
+            presage::libsignal_service::proto::typing_message::Action::Started as i32
+        } else {
+            presage::libsignal_service::proto::typing_message::Action::Stopped as i32
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        if let Some(ref group_id_hex) = typing.group_id {
+            // Group typing indicator
+            let master_key_bytes = match hex::decode(group_id_hex) {
+                Ok(b) if b.len() == 32 => b,
+                _ => {
+                    tracing::error!("Invalid group_id hex for typing: {}", group_id_hex);
+                    continue;
+                }
+            };
+
+            let typing_msg = presage::libsignal_service::proto::TypingMessage {
+                timestamp: Some(timestamp),
+                action: Some(action),
+                group_id: Some(master_key_bytes.clone()),
+            };
+            let body = ContentBody::TypingMessage(typing_msg);
+
+            match manager.send_message_to_group(&master_key_bytes, body, timestamp).await {
+                Ok(()) => tracing::debug!("Typing indicator sent to group {}", group_id_hex),
+                Err(e) => tracing::error!("Typing indicator failed for group {}: {e:#}", group_id_hex),
+            }
+        } else if let Some(ref recipient) = typing.recipient {
+            // DM typing indicator
+            let service_id = if let Ok(uuid) = recipient.parse::<Uuid>() {
+                ServiceId::Aci(uuid.into())
+            } else {
+                tracing::warn!("Cannot resolve typing recipient '{}' — UUID required", recipient);
+                continue;
+            };
+
+            let typing_msg = presage::libsignal_service::proto::TypingMessage {
+                timestamp: Some(timestamp),
+                action: Some(action),
+                group_id: None,
+            };
+            let body = ContentBody::TypingMessage(typing_msg);
+
+            match manager.send_message(service_id, body, timestamp).await {
+                Ok(()) => tracing::debug!("Typing indicator sent to {}", recipient),
+                Err(e) => tracing::error!("Typing indicator failed for {}: {e:#}", recipient),
             }
         }
     }

@@ -43,11 +43,19 @@ pub struct PendingGroupSend {
     pub message: String,
 }
 
+/// Typing indicator request queued by the HTTP handler, processed by the receiver thread.
+pub struct PendingTyping {
+    pub recipient: Option<String>,
+    pub group_id: Option<String>,
+    pub started: bool,
+}
+
 pub struct AppState {
     pub message_queue: Vec<ReceivedMessage>,
     pub send_queue: Vec<PendingSend>,
     pub group_send_queue: Vec<PendingGroupSend>,
     pub group_create_queue: Vec<PendingGroupCreate>,
+    pub typing_queue: Vec<PendingTyping>,
     pub messages_received: u64,
     pub connected: bool,
     pub phone_number: String,
@@ -112,6 +120,7 @@ async fn async_main() -> anyhow::Result<()> {
         send_queue: Vec::new(),
         group_send_queue: Vec::new(),
         group_create_queue: Vec::new(),
+        typing_queue: Vec::new(),
         messages_received: 0,
         connected: false,
         phone_number: String::new(),
@@ -175,6 +184,7 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/status", get(handle_status))
         .route("/create-group", post(handle_create_group))
         .route("/tee-pubkey", get(handle_tee_pubkey))
+        .route("/typing", post(handle_typing))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -291,6 +301,19 @@ async fn handle_tee_pubkey(State(state): State<SharedState>) -> Json<TeePubkeyRe
     let s = state.lock().await;
     let pubkey_hex = hex::encode(s.tee_signing_key.verifying_key().as_bytes());
     Json(TeePubkeyResponse { pubkey_hex })
+}
+
+async fn handle_typing(
+    State(state): State<SharedState>,
+    Json(req): Json<TypingRequest>,
+) -> Json<SendResponse> {
+    let mut s = state.lock().await;
+    s.typing_queue.push(PendingTyping {
+        recipient: req.recipient,
+        group_id: req.group_id,
+        started: req.started,
+    });
+    Json(SendResponse { success: true, error: None })
 }
 
 /// Interactive registration via SMS verification code.

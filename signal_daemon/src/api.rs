@@ -41,6 +41,14 @@ pub struct ReceivedMessage {
 
     /// SKDM signing key (hex, 32 bytes Curve25519) — present only for SKDM events
     pub skdm_signing_key: Option<String>,
+
+    /// True if this message represents a group member accepting an invite
+    #[serde(default)]
+    pub is_member_joined: bool,
+
+    /// UUID of the member who joined (if is_member_joined is true)
+    #[serde(default)]
+    pub joined_member_uuid: Option<String>,
 }
 
 /// The fields needed by the Soroban contract's SealedEnvelope.
@@ -118,6 +126,14 @@ pub struct CreateGroupResponse {
     pub success: bool,
     pub group_id: Option<String>,
     pub error: Option<String>,
+}
+
+/// Request for POST /typing
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TypingRequest {
+    pub recipient: Option<String>,  // UUID for DM typing
+    pub group_id: Option<String>,   // hex group ID for group typing
+    pub started: bool,
 }
 
 /// Response for GET /tee-pubkey

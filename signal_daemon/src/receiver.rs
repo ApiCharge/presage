@@ -54,8 +54,46 @@ pub async fn run_receive_loop(
                     Some(Received::Content { content, .. }) => {
                         handle_content(*content, &app_state).await;
                     }
-                    Some(Received::SenderKeyDistribution { sender, .. }) => {
-                        tracing::info!("SenderKeyDistribution from {sender}");
+                    Some(Received::SenderKeyDistribution { sender, signing_key, .. }) => {
+                        let key_hex = signing_key.as_ref().map(hex::encode).unwrap_or_default();
+                        tracing::info!("SenderKeyDistribution from {sender}, signing_key={key_hex}");
+
+                        if let Some(sk) = signing_key {
+                            // Queue SKDM event for the relay with TEE signature
+                            let sender_uuid = if sender.is_empty() { "unknown".to_string() } else { sender };
+                            let sk_hex = hex::encode(&sk);
+
+                            // Sign: sender_uuid || signing_key
+                            let mut sign_data = Vec::new();
+                            sign_data.extend_from_slice(sender_uuid.as_bytes());
+                            sign_data.extend_from_slice(&sk);
+                            let tee_sig = {
+                                let s = app_state.lock().await;
+                                let sig = s.tee_signing_key.sign(&sign_data);
+                                hex::encode(sig.to_bytes())
+                            };
+
+                            let msg = ReceivedMessage {
+                                sender_uuid,
+                                sender_phone: None,
+                                sender_identity_key: None,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                                sealed_envelope: Default::default(),
+                                verified_envelope: None,
+                                tee_signature: Some(tee_sig),
+                                decrypted_body: None,
+                                group_id: None,
+                                is_skdm: true,
+                                skdm_signing_key: Some(sk_hex),
+                            };
+
+                            let mut s = app_state.lock().await;
+                            s.message_queue.push(msg);
+                            s.messages_received += 1;
+                        }
                     }
                     Some(Received::QueueEmpty) => {
                         tracing::debug!("WebSocket queue empty");
@@ -116,6 +154,8 @@ async fn handle_content(content: Content, app_state: &Arc<Mutex<crate::AppState>
             tee_signature: None,
             decrypted_body: body,
             group_id,
+            is_skdm: false,
+            skdm_signing_key: None,
         };
 
         // Sign the message with the TEE key.

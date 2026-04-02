@@ -881,11 +881,14 @@ impl<S: Store> Manager<S, Registered> {
                                     // if a message key was captured (meaning decryption happened).
                                     let mk = libsignal_protocol::LAST_MESSAGE_KEY.with(|cell| cell.borrow_mut().take());
                                     let _ = libsignal_protocol::LAST_PQR_SALT.with(|cell| cell.borrow_mut().take());
+                                    let skdm_signing_key = libsignal_protocol::LAST_SKDM_SIGNING_KEY.with(|cell| cell.borrow_mut().take());
                                     if raw_content.is_some() && mk.is_some() {
-                                        debug!("SKDM detected (envelope decrypted but content filtered)");
+                                        debug!("SKDM detected (envelope decrypted but content filtered), signing_key={}", skdm_signing_key.as_ref().map(hex::encode).unwrap_or_default());
                                         return Some((Received::SenderKeyDistribution {
                                             raw_content: raw_content.clone(),
                                             sender: String::new(), // sender unknown from Ok(None)
+                                            signing_key: skdm_signing_key,
+                                            skdm_bytes: None,
                                         }, state));
                                     } else {
                                         debug!("empty envelope, message will be skipped!")

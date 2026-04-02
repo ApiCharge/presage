@@ -38,9 +38,13 @@ pub enum Received {
     /// libsignal processes SKDMs internally (stores the sender key) and returns Ok(None).
     /// We surface them here so the daemon can detect key distribution events for zkFetch.
     SenderKeyDistribution {
-        /// Raw sealed sender envelope bytes (for zkFetch attestation)
+        /// Raw sealed sender envelope bytes (for TEE attestation)
         raw_content: Option<Vec<u8>>,
         /// Sender's service ID (extracted from sealed sender metadata)
         sender: String,
+        /// The SKDM signing key (32 bytes, Curve25519) if available
+        signing_key: Option<Vec<u8>>,
+        /// The raw SenderKeyDistributionMessage protobuf bytes
+        skdm_bytes: Option<Vec<u8>>,
     },
 }

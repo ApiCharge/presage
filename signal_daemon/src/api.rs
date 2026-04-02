@@ -34,6 +34,13 @@ pub struct ReceivedMessage {
 
     /// Group ID (hex-encoded master key) if this is a group message
     pub group_id: Option<String>,
+
+    /// True if this is a SenderKeyDistributionMessage event (not a regular message)
+    #[serde(default)]
+    pub is_skdm: bool,
+
+    /// SKDM signing key (hex, 32 bytes Curve25519) — present only for SKDM events
+    pub skdm_signing_key: Option<String>,
 }
 
 /// The fields needed by the Soroban contract's SealedEnvelope.

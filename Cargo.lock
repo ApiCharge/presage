@@ -365,7 +365,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 [[package]]
 name = "attest"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "asn1",
  "bitflags",
@@ -1042,7 +1042,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.114",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2278,7 +2278,7 @@ dependencies = [
 [[package]]
 name = "libsignal-account-keys"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "argon2",
  "derive_more",
@@ -2301,7 +2301,7 @@ dependencies = [
 [[package]]
 name = "libsignal-core"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "curve25519-dalek",
  "derive_more",
@@ -2319,7 +2319,7 @@ dependencies = [
 [[package]]
 name = "libsignal-keytrans"
 version = "0.0.1"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "curve25519-dalek",
  "displaydoc",
@@ -2335,7 +2335,7 @@ dependencies = [
 [[package]]
 name = "libsignal-net"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -2394,7 +2394,7 @@ dependencies = [
 [[package]]
 name = "libsignal-net-infra"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -2445,7 +2445,7 @@ dependencies = [
 [[package]]
 name = "libsignal-protocol"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "aes",
  "aes-gcm-siv",
@@ -2527,7 +2527,7 @@ dependencies = [
 [[package]]
 name = "libsignal-svrb"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "aes-gcm-siv",
  "curve25519-dalek",
@@ -3141,7 +3141,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "poksho"
 version = "0.7.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "curve25519-dalek",
  "hmac",
@@ -4195,7 +4195,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "signal-crypto"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "aes",
  "cbc",
@@ -5176,7 +5176,7 @@ dependencies = [
 [[package]]
 name = "usernames"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "curve25519-dalek",
  "displaydoc",
@@ -5489,7 +5489,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -6217,7 +6217,7 @@ dependencies = [
 [[package]]
 name = "zkcredential"
 version = "0.1.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "cfg-if",
  "curve25519-dalek",
@@ -6235,7 +6235,7 @@ dependencies = [
 [[package]]
 name = "zkgroup"
 version = "0.9.0"
-source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#e886ac96f7d24efd870f349d5aca926583dde08c"
+source = "git+https://github.com/ApiCharge/libsignal?branch=apicharge-v0.87.4#7d742d32b0db1dfdaad494e6c8d77b5bc130ff21"
 dependencies = [
  "aes",
  "aes-gcm-siv",

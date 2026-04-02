@@ -196,7 +196,7 @@ async fn handle_send(
     State(state): State<SharedState>,
     Json(req): Json<SendRequest>,
 ) -> Json<SendResponse> {
-    tracing::info!("Queuing send to {}: {}", req.recipient, req.message);
+    tracing::info!("Queuing send to {}", req.recipient);
     let mut s = state.lock().await;
     s.send_queue.push(PendingSend {
         recipient: req.recipient,
@@ -212,7 +212,7 @@ async fn handle_send_group(
     State(state): State<SharedState>,
     Json(req): Json<GroupSendRequest>,
 ) -> Json<SendResponse> {
-    tracing::info!("Queuing group send to {}: {}", req.group_id, req.message);
+    tracing::info!("Queuing group send to {}", req.group_id);
     let mut s = state.lock().await;
     s.group_send_queue.push(PendingGroupSend {
         group_id: req.group_id,

@@ -149,7 +149,7 @@ async fn process_pending_sends(
     };
 
     for send in sends {
-        tracing::info!("Sending to {}: {}", send.recipient, send.message);
+        tracing::info!("Sending to {}", send.recipient);
 
         let service_id = if let Ok(uuid) = send.recipient.parse::<Uuid>() {
             ServiceId::Aci(uuid.into())
@@ -186,7 +186,7 @@ async fn process_pending_group_sends(
     };
 
     for send in sends {
-        tracing::info!("Sending to group {}: {}", send.group_id, send.message);
+        tracing::info!("Sending to group {}", send.group_id);
 
         let master_key_bytes = match hex::decode(&send.group_id) {
             Ok(b) if b.len() == 32 => b,

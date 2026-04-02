@@ -1089,6 +1089,15 @@ impl<S: Store> Manager<S, Registered> {
         self.restore_thread_timer(&thread, &mut content_body).await;
         ensure_data_message_timestamp(&mut content_body, timestamp);
 
+        // Attach GroupContextV2 so receiving clients display the message in the group
+        if let ContentBody::DataMessage(ref mut dm) = content_body {
+            dm.group_v2 = Some(libsignal_service::proto::GroupContextV2 {
+                master_key: Some(master_key_bytes.to_vec()),
+                revision: Some(0),
+                group_change: None,
+            });
+        }
+
         let mut sender = self.new_message_sender().await?;
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;

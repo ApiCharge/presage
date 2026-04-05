@@ -61,6 +61,9 @@ pub struct AppState {
     pub phone_number: String,
     pub uuid: String,
     pub tee_signing_key: SigningKey,
+    /// Group IDs the daemon has seen (populated from incoming messages + group creates).
+    /// Used by /list-groups for fee change notifications.
+    pub known_group_ids: std::collections::HashSet<String>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -126,6 +129,7 @@ async fn async_main() -> anyhow::Result<()> {
         phone_number: String::new(),
         uuid: String::new(),
         tee_signing_key,
+        known_group_ids: std::collections::HashSet::new(),
     }));
 
     // Run the receiver on a dedicated OS thread (presage futures are huge in debug)
@@ -155,6 +159,21 @@ async fn async_main() -> anyhow::Result<()> {
                     s.phone_number = reg.phone_number.to_string();
                     s.uuid = reg.service_ids.aci.to_string();
                     tracing::info!("Connected as {} ({})", s.phone_number, s.uuid);
+
+                    // Load all known groups from presage store into the cache
+                    match manager.store().groups().await {
+                        Ok(groups_iter) => {
+                            let mut count = 0;
+                            for group_result in groups_iter {
+                                if let Ok((master_key, _group)) = group_result {
+                                    s.known_group_ids.insert(hex::encode(master_key));
+                                    count += 1;
+                                }
+                            }
+                            tracing::info!("Loaded {count} known groups from store");
+                        }
+                        Err(e) => tracing::warn!("Failed to load groups from store: {e:#}"),
+                    }
                 }
 
                 loop {
@@ -185,6 +204,8 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/create-group", post(handle_create_group))
         .route("/tee-pubkey", get(handle_tee_pubkey))
         .route("/typing", post(handle_typing))
+        .route("/list-groups", get(handle_list_groups))
+        .route("/tee-sign", post(handle_tee_sign))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -314,6 +335,32 @@ async fn handle_typing(
         started: req.started,
     });
     Json(SendResponse { success: true, error: None })
+}
+
+async fn handle_list_groups(State(state): State<SharedState>) -> Json<ListGroupsResponse> {
+    let s = state.lock().await;
+    let group_ids: Vec<String> = s.known_group_ids.iter().cloned().collect();
+    Json(ListGroupsResponse { group_ids })
+}
+
+async fn handle_tee_sign(
+    State(state): State<SharedState>,
+    Json(req): Json<TeeSignRequest>,
+) -> Json<TeeSignResponse> {
+    use ed25519_dalek::Signer;
+    let payload = match hex::decode(&req.payload_hex) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(TeeSignResponse {
+                signature_hex: format!("error: invalid hex: {e}"),
+            });
+        }
+    };
+    let s = state.lock().await;
+    let sig = s.tee_signing_key.sign(&payload);
+    Json(TeeSignResponse {
+        signature_hex: hex::encode(sig.to_bytes()),
+    })
 }
 
 /// Interactive registration via SMS verification code.

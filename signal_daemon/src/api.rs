@@ -142,6 +142,24 @@ pub struct TeePubkeyResponse {
     pub pubkey_hex: String,
 }
 
+/// Response for GET /list-groups
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListGroupsResponse {
+    pub group_ids: Vec<String>,
+}
+
+/// Request for POST /tee-sign
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TeeSignRequest {
+    pub payload_hex: String,
+}
+
+/// Response for POST /tee-sign
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TeeSignResponse {
+    pub signature_hex: String,
+}
+
 /// A detected SenderKeyDistributionMessage event.
 /// The daemon surfaces these so the relay can trigger TEE attestation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

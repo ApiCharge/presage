@@ -196,6 +196,10 @@ async fn handle_content(content: Content, app_state: &Arc<Mutex<crate::AppState>
         }
 
         let mut s = app_state.lock().await;
+        // Track group ID for /list-groups (persistent across session)
+        if let Some(ref gid) = msg.group_id {
+            s.known_group_ids.insert(gid.clone());
+        }
         s.message_queue.push(msg);
         s.messages_received += 1;
     }
@@ -311,6 +315,11 @@ async fn process_pending_group_creates(
             Ok(master_key_bytes) => {
                 let group_id = hex::encode(master_key_bytes);
                 tracing::info!("Group '{}' created, id={}", create.name, group_id);
+                // Track in known groups cache
+                {
+                    let mut s = app_state.lock().await;
+                    s.known_group_ids.insert(group_id.clone());
+                }
                 let _ = create.response_tx.send(Ok(group_id));
             }
             Err(e) => {

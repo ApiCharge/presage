@@ -223,7 +223,7 @@ async fn auto_claim_username(db_path: &str, _state: &SharedState) -> anyhow::Res
     let store = presage_store_sqlite::SqliteStore::open_with_passphrase(
         db_path, None, OnNewIdentity::Trust,
     ).await?;
-    let manager = presage::Manager::load_registered(store).await?;
+    let mut manager = presage::Manager::load_registered(store).await?;
 
     // Generate random 4-char suffix: lowercase alphanumeric
     let suffix: String = {
@@ -251,13 +251,13 @@ async fn auto_claim_username(db_path: &str, _state: &SharedState) -> anyhow::Res
     tracing::info!("Generated {} candidates", candidates.len());
 
     // Compute hashes
-    let mut hashes: Vec<[u8; 32]> = Vec::new();
-    let mut candidate_map: std::collections::HashMap<[u8; 32], String> = std::collections::HashMap::new();
+    let mut hashes: Vec<Vec<u8>> = Vec::new();
+    let mut candidate_map: std::collections::HashMap<Vec<u8>, String> = std::collections::HashMap::new();
     for candidate in &candidates {
         if let Ok(u) = Username::new(candidate) {
-            let hash = u.hash();
+            let hash = u.hash().to_vec();
+            candidate_map.insert(hash.clone(), candidate.clone());
             hashes.push(hash);
-            candidate_map.insert(hash, candidate.clone());
         }
     }
 
@@ -265,45 +265,11 @@ async fn auto_claim_username(db_path: &str, _state: &SharedState) -> anyhow::Res
         return Err(anyhow::anyhow!("no valid candidates"));
     }
 
-    // Reserve with Signal server
-    let hashes_b64: Vec<String> = hashes.iter()
-        .map(|h| base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, h))
-        .collect();
-    let reserve_body = serde_json::json!({ "usernameHashes": hashes_b64 });
+    tracing::info!("Reserving username via presage websocket...");
+    let reserved_hash = manager.reserve_username(hashes).await
+        .map_err(|e| anyhow::anyhow!("reserve failed: {e:?}"))?;
 
-    let reg = manager.registration_data();
-    let credentials = format!("{}:{}", reg.service_ids.aci, reg.password);
-    let auth_header = format!("Basic {}", base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD, credentials.as_bytes()));
-
-    let signal_host = std::env::var("SIGNAL_HOST").unwrap_or_else(|_| "chat.signal.org".into());
-    let http_client = reqwest::Client::new();
-
-    let reserve_url = format!("https://{signal_host}/v1/accounts/username_hash/reserve");
-    tracing::info!("Reserving username at {reserve_url}...");
-
-    let reserve_resp = http_client.put(&reserve_url)
-        .header("Authorization", &auth_header)
-        .json(&reserve_body)
-        .send()
-        .await?;
-
-    if !reserve_resp.status().is_success() {
-        let status = reserve_resp.status();
-        let body = reserve_resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("reserve failed (HTTP {status}): {body}"));
-    }
-
-    let reserve_result: serde_json::Value = reserve_resp.json().await?;
-    let selected_hash_b64 = reserve_result["usernameHash"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("reserve response missing usernameHash"))?
-        .to_string();
-
-    let selected_hash_bytes: [u8; 32] = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD, &selected_hash_b64
-    )?.try_into().map_err(|_| anyhow::anyhow!("invalid hash length"))?;
-
-    let selected_username = candidate_map.get(&selected_hash_bytes)
+    let selected_username = candidate_map.get(&reserved_hash)
         .ok_or_else(|| anyhow::anyhow!("reserved hash doesn't match any candidate"))?
         .clone();
 
@@ -316,23 +282,8 @@ async fn auto_claim_username(db_path: &str, _state: &SharedState) -> anyhow::Res
     let proof = username_obj.proof(&randomness)
         .map_err(|e| anyhow::anyhow!("ZK proof failed: {e:?}"))?;
 
-    let confirm_body = serde_json::json!({
-        "usernameHash": selected_hash_b64,
-        "zkProof": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &proof),
-    });
-
-    let confirm_url = format!("https://{signal_host}/v1/accounts/username_hash/confirm");
-    let confirm_resp = http_client.put(&confirm_url)
-        .header("Authorization", &auth_header)
-        .json(&confirm_body)
-        .send()
-        .await?;
-
-    if !confirm_resp.status().is_success() {
-        let status = confirm_resp.status();
-        let body = confirm_resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("confirm failed (HTTP {status}): {body}"));
-    }
+    manager.confirm_username(&reserved_hash, &proof).await
+        .map_err(|e| anyhow::anyhow!("confirm failed: {e:?}"))?;
 
     // Persist to disk
     persist_username(db_path, &selected_username)?;

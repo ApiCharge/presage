@@ -141,7 +141,7 @@ async fn async_main() -> anyhow::Result<()> {
         connected: false,
         phone_number: String::new(),
         uuid: String::new(),
-        username: persisted_username,
+        username: persisted_username.clone(),
         tee_signing_key,
         known_group_ids: std::collections::HashSet::new(),
         db_path: db_path.clone(),
@@ -216,7 +216,7 @@ async fn async_main() -> anyhow::Result<()> {
 }
 
 /// Auto-claim a Signal username with format apicharge_XXXX where XXXX is random lowercase alphanumeric.
-async fn auto_claim_username(db_path: &str, state: &SharedState) -> anyhow::Result<String> {
+async fn auto_claim_username(db_path: &str, _state: &SharedState) -> anyhow::Result<String> {
     use presage::model::identity::OnNewIdentity;
     use usernames::{Username, NicknameLimits};
 
@@ -238,7 +238,7 @@ async fn auto_claim_username(db_path: &str, state: &SharedState) -> anyhow::Resu
     tracing::info!("Generated nickname: {nickname}");
 
     // Generate candidates manually (avoid rand version mismatch with usernames crate)
-    let limits = NicknameLimits::default();
+    let _limits = NicknameLimits::default();
     let mut candidates = Vec::new();
     for disc in 1..=99u32 {
         let candidate = format!("{nickname}.{disc:02}");

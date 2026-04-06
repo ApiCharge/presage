@@ -145,7 +145,6 @@ async fn async_main() -> anyhow::Result<()> {
         tee_signing_key,
         known_group_ids: std::collections::HashSet::new(),
         db_path: db_path.clone(),
-        pending_confirmation: None,
         registration_complete_tx: if initial_mode == DaemonMode::Registration {
             Some(reg_complete_tx)
         } else {

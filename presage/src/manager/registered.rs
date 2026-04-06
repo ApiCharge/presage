@@ -1001,7 +1001,9 @@ impl<S: Store> Manager<S, Registered> {
 
         let hash = BASE64_URL_SAFE_NO_PAD
             .decode(&response.username_hash)
-            .map_err(|_| Error::UnverifiedRegistration)?;
+            .map_err(|_| Error::ServiceError(libsignal_service::prelude::ServiceError::InvalidFrame {
+                reason: "invalid base64 in username hash response",
+            }))?;
         Ok(hash)
     }
 

@@ -138,7 +138,7 @@ pub struct RegistrationData {
     pub phone_number: PhoneNumber,
     #[serde(flatten)]
     pub service_ids: ServiceIds,
-    pub(crate) password: String,
+    pub password: String,
     pub device_id: Option<u32>,
     pub registration_id: u32,
     #[serde(default)]

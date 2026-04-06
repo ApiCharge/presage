@@ -50,7 +50,17 @@ pub struct PendingTyping {
     pub started: bool,
 }
 
+/// Daemon operating mode
+#[derive(Clone, PartialEq)]
+pub enum DaemonMode {
+    /// No Signal identity — waiting for operator to register via HTTP
+    Registration,
+    /// Signal identity exists — processing messages
+    Normal,
+}
+
 pub struct AppState {
+    pub mode: DaemonMode,
     pub message_queue: Vec<ReceivedMessage>,
     pub send_queue: Vec<PendingSend>,
     pub group_send_queue: Vec<PendingGroupSend>,
@@ -60,10 +70,17 @@ pub struct AppState {
     pub connected: bool,
     pub phone_number: String,
     pub uuid: String,
+    pub username: Option<String>,
     pub tee_signing_key: SigningKey,
     /// Group IDs the daemon has seen (populated from incoming messages + group creates).
     /// Used by /list-groups for fee change notifications.
     pub known_group_ids: std::collections::HashSet<String>,
+    /// Presage DB path (needed for registration flow)
+    pub db_path: String,
+    /// Pending confirmation manager (held between register step 1 and verify step 2)
+    pub pending_confirmation: Option<Box<dyn std::any::Any + Send>>,
+    /// Signal to the receiver thread that registration completed and it should start
+    pub registration_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -86,39 +103,30 @@ async fn async_main() -> anyhow::Result<()> {
     let listen_addr =
         std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:7584".into());
 
-    // Handle --register: fresh Signal registration via SMS
-    if std::env::args().any(|a| a == "--register") {
-        return register_account(&db_path).await;
-    }
-
     tracing::info!("Using presage store at {db_path}");
 
-    // Load or generate TEE Ed25519 signing key
-    let tee_signing_key = match std::env::var("TEE_SIGNING_KEY") {
-        Ok(hex_key) => {
-            let bytes = hex::decode(&hex_key)
-                .map_err(|e| anyhow::anyhow!("TEE_SIGNING_KEY invalid hex: {e}"))?;
-            let secret: [u8; 32] = bytes
-                .try_into()
-                .map_err(|v: Vec<u8>| anyhow::anyhow!("TEE_SIGNING_KEY must be 32 bytes (64 hex chars), got {}", v.len()))?;
-            let key = SigningKey::from_bytes(&secret);
-            tracing::info!(
-                "TEE signing key loaded from env, pubkey={}",
-                hex::encode(key.verifying_key().as_bytes())
-            );
-            key
-        }
-        Err(_) => {
-            let key = SigningKey::generate(&mut rand::rngs::OsRng);
-            tracing::warn!(
-                "TEE_SIGNING_KEY not set — using ephemeral key for development. pubkey={}",
-                hex::encode(key.verifying_key().as_bytes())
-            );
-            key
-        }
+    // Generate ephemeral TEE Ed25519 signing key (fresh every boot)
+    let tee_signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    tracing::info!(
+        "TEE ephemeral key generated, pubkey={}",
+        hex::encode(tee_signing_key.verifying_key().as_bytes())
+    );
+
+    // Detect mode: does a registered identity exist?
+    let has_identity = check_identity_exists(&db_path).await;
+    let initial_mode = if has_identity {
+        tracing::info!("Signal identity found — starting in NORMAL mode");
+        DaemonMode::Normal
+    } else {
+        tracing::info!("No Signal identity — starting in REGISTRATION mode");
+        tracing::info!("Complete registration via HTTP: POST /register-signal, then POST /register-signal/verify");
+        DaemonMode::Registration
     };
 
+    let (reg_complete_tx, reg_complete_rx) = tokio::sync::oneshot::channel::<()>();
+
     let state: SharedState = Arc::new(Mutex::new(AppState {
+        mode: initial_mode.clone(),
         message_queue: Vec::new(),
         send_queue: Vec::new(),
         group_send_queue: Vec::new(),
@@ -128,13 +136,76 @@ async fn async_main() -> anyhow::Result<()> {
         connected: false,
         phone_number: String::new(),
         uuid: String::new(),
+        username: None,
         tee_signing_key,
         known_group_ids: std::collections::HashSet::new(),
+        db_path: db_path.clone(),
+        pending_confirmation: None,
+        registration_complete_tx: if initial_mode == DaemonMode::Registration {
+            Some(reg_complete_tx)
+        } else {
+            None
+        },
     }));
 
-    // Run the receiver on a dedicated OS thread (presage futures are huge in debug)
-    let recv_state = state.clone();
-    let recv_db = db_path.clone();
+    // Start receiver thread (only if identity exists; otherwise wait for registration)
+    if initial_mode == DaemonMode::Normal {
+        start_receiver_thread(state.clone(), db_path.clone());
+    } else {
+        // Spawn a task that waits for registration to complete, then starts the receiver
+        let recv_state = state.clone();
+        let recv_db = db_path.clone();
+        tokio::spawn(async move {
+            let _ = reg_complete_rx.await;
+            tracing::info!("Registration complete — starting receiver thread");
+            start_receiver_thread(recv_state, recv_db);
+        });
+    }
+
+    // HTTP server — all routes available in all modes.
+    // Registration endpoints return 403 in normal mode (identity is irreversible).
+    // Normal-mode endpoints return 503 in registration mode.
+    let app = Router::new()
+        // Normal mode endpoints
+        .route("/receive", get(handle_receive))
+        .route("/send", post(handle_send))
+        .route("/send-group", post(handle_send_group))
+        .route("/create-group", post(handle_create_group))
+        .route("/tee-pubkey", get(handle_tee_pubkey))
+        .route("/typing", post(handle_typing))
+        .route("/list-groups", get(handle_list_groups))
+        .route("/tee-sign", post(handle_tee_sign))
+        // Registration mode endpoints
+        .route("/register-signal", post(handle_register_signal))
+        .route("/register-signal/verify", post(handle_verify_code))
+        .route("/set-username", post(handle_set_username))
+        // Status (both modes)
+        .route("/status", get(handle_status))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    tracing::info!("HTTP server listening on {listen_addr}");
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Check if a registered Signal identity exists in the presage store.
+async fn check_identity_exists(db_path: &str) -> bool {
+    use presage::model::identity::OnNewIdentity;
+    match presage_store_sqlite::SqliteStore::open_with_passphrase(db_path, None, OnNewIdentity::Trust).await {
+        Ok(store) => {
+            match presage::Manager::load_registered(store).await {
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Start the presage receiver on a dedicated OS thread.
+fn start_receiver_thread(state: SharedState, db_path: String) {
     std::thread::Builder::new()
         .name("presage-receiver".into())
         .stack_size(16 * 1024 * 1024)
@@ -144,8 +215,7 @@ async fn async_main() -> anyhow::Result<()> {
                 .build()
                 .expect("failed to build receiver runtime");
             rt.block_on(async {
-                // Create manager ONCE — reuse across reconnects to avoid ghost WebSocket overlap
-                let mut manager = match receiver::create_manager(&recv_db).await {
+                let mut manager = match receiver::create_manager(&db_path).await {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::error!("Failed to create manager: {e:#}");
@@ -153,7 +223,7 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                 };
                 {
-                    let mut s = recv_state.lock().await;
+                    let mut s = state.lock().await;
                     s.connected = true;
                     let reg = manager.registration_data();
                     s.phone_number = reg.phone_number.to_string();
@@ -178,41 +248,22 @@ async fn async_main() -> anyhow::Result<()> {
 
                 loop {
                     let queue = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                    match receiver::run_receive_loop(&mut manager, queue.clone(), recv_state.clone()).await {
+                    match receiver::run_receive_loop(&mut manager, queue.clone(), state.clone()).await {
                         Ok(()) => tracing::info!("Receiver ended, reconnecting in 10s..."),
                         Err(e) => tracing::error!("Receiver error: {e:#}, reconnecting in 10s..."),
                     }
-                    // Move messages to main state
                     {
                         let mut remaining = queue.lock().await;
                         if !remaining.is_empty() {
-                            let mut s = recv_state.lock().await;
+                            let mut s = state.lock().await;
                             s.message_queue.append(&mut remaining);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 }
             });
-        })?;
-
-    // HTTP server on the main thread
-    let app = Router::new()
-        .route("/receive", get(handle_receive))
-        .route("/send", post(handle_send))
-        .route("/send-group", post(handle_send_group))
-        .route("/status", get(handle_status))
-        .route("/create-group", post(handle_create_group))
-        .route("/tee-pubkey", get(handle_tee_pubkey))
-        .route("/typing", post(handle_typing))
-        .route("/list-groups", get(handle_list_groups))
-        .route("/tee-sign", post(handle_tee_sign))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-    tracing::info!("HTTP server listening on {listen_addr}");
-    axum::serve(listener, app).await?;
-
-    Ok(())
+        })
+        .expect("failed to spawn receiver thread");
 }
 
 // ---- HTTP Handlers ----
@@ -255,12 +306,17 @@ async fn handle_send_group(
     })
 }
 
-async fn handle_status(State(state): State<SharedState>) -> Json<StatusResponse> {
+async fn handle_status(State(state): State<SharedState>) -> Json<ExtendedStatusResponse> {
     let s = state.lock().await;
-    Json(StatusResponse {
+    Json(ExtendedStatusResponse {
         connected: s.connected,
+        mode: match s.mode {
+            DaemonMode::Registration => "registration".to_string(),
+            DaemonMode::Normal => "normal".to_string(),
+        },
         phone_number: s.phone_number.clone(),
         uuid: s.uuid.clone(),
+        username: s.username.clone(),
         messages_received: s.messages_received,
     })
 }
@@ -363,40 +419,62 @@ async fn handle_tee_sign(
     })
 }
 
-/// Interactive registration via SMS verification code.
-/// Usage: signal-daemon --register
-/// Env vars: PRESAGE_DB_PATH (sqlite URL for the presage store)
-async fn register_account(db_path: &str) -> anyhow::Result<()> {
+// ── Registration Mode HTTP Handlers ──────────────────────────────
+
+/// POST /register-signal — Step 1: Initiate Signal registration with phone + CAPTCHA.
+/// Sends SMS to the provided phone number.
+async fn handle_register_signal(
+    State(state): State<SharedState>,
+    Json(req): Json<RegisterSignalRequest>,
+) -> Json<RegisterSignalResponse> {
     use presage::libsignal_service::configuration::SignalServers;
     use presage::manager::RegistrationOptions;
     use presage::model::identity::OnNewIdentity;
 
-    println!("=== Signal Registration ===");
-    println!();
+    {
+        let s = state.lock().await;
+        if s.mode != DaemonMode::Registration {
+            return Json(RegisterSignalResponse {
+                success: false,
+                message: String::new(),
+                error: Some("Identity already exists. Registration is irreversible.".into()),
+            });
+        }
+    }
 
-    // Get phone number
-    println!("Enter phone number (E.164 format, e.g. +420702843097):");
-    let mut phone_input = String::new();
-    std::io::stdin().read_line(&mut phone_input)?;
-    let phone_number = phonenumber::parse(None, phone_input.trim())?;
+    let phone_number = match phonenumber::parse(None, &req.phone_number) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(RegisterSignalResponse {
+                success: false,
+                message: String::new(),
+                error: Some(format!("Invalid phone number: {e}")),
+            });
+        }
+    };
 
-    // Get captcha
-    println!();
-    println!("Go to: https://signalcaptchas.org/registration/generate.html");
-    println!("Solve the captcha, copy the signalcaptcha:// URL, and paste it here:");
-    let mut captcha_input = String::new();
-    std::io::stdin().read_line(&mut captcha_input)?;
-    let captcha = captcha_input.trim().to_string();
+    let db_path = {
+        let s = state.lock().await;
+        s.db_path.clone()
+    };
 
-    // Open or create the store
-    let store = presage_store_sqlite::SqliteStore::open_with_passphrase(
-        db_path, None, OnNewIdentity::Trust,
-    ).await?;
+    let store = match presage_store_sqlite::SqliteStore::open_with_passphrase(
+        &db_path, None, OnNewIdentity::Trust,
+    ).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Json(RegisterSignalResponse {
+                success: false,
+                message: String::new(),
+                error: Some(format!("Failed to open store: {e}")),
+            });
+        }
+    };
 
-    println!();
-    println!("Sending SMS to {}...", phone_number);
+    tracing::info!("Registering with Signal: {}...", req.phone_number);
 
-    let confirmation_manager = presage::Manager::register(
+    let captcha = req.captcha.clone();
+    match presage::Manager::register(
         store,
         RegistrationOptions {
             signal_servers: SignalServers::Production,
@@ -405,24 +483,341 @@ async fn register_account(db_path: &str) -> anyhow::Result<()> {
             captcha: Some(&captcha),
             force: true,
         },
-    )
-    .await?;
+    ).await {
+        Ok(confirmation_manager) => {
+            // Store the confirmation manager for the verify step
+            let mut s = state.lock().await;
+            s.pending_confirmation = Some(Box::new(confirmation_manager));
+            tracing::info!("SMS sent to {}. Awaiting verification code.", req.phone_number);
+            Json(RegisterSignalResponse {
+                success: true,
+                message: "SMS sent. Submit the 6-digit code via POST /register-signal/verify".into(),
+                error: None,
+            })
+        }
+        Err(e) => {
+            tracing::error!("Registration failed: {e:#}");
+            Json(RegisterSignalResponse {
+                success: false,
+                message: String::new(),
+                error: Some(format!("Registration failed: {e}")),
+            })
+        }
+    }
+}
 
-    println!("SMS sent! Enter the 6-digit verification code:");
-    let mut code_input = String::new();
-    std::io::stdin().read_line(&mut code_input)?;
-    let code = code_input.trim().to_string();
+/// POST /register-signal/verify — Step 2: Submit the SMS verification code.
+/// Completes registration and transitions to normal mode.
+async fn handle_verify_code(
+    State(state): State<SharedState>,
+    Json(req): Json<VerifyCodeRequest>,
+) -> Json<RegisterSignalResponse> {
+    let confirmation: Option<Box<dyn std::any::Any + Send>>;
+    {
+        let mut s = state.lock().await;
+        if s.mode != DaemonMode::Registration {
+            return Json(RegisterSignalResponse {
+                success: false,
+                message: String::new(),
+                error: Some("Not in registration mode.".into()),
+            });
+        }
+        confirmation = s.pending_confirmation.take();
+    }
 
-    let registered = confirmation_manager
-        .confirm_verification_code(code)
-        .await?;
+    let confirmation = match confirmation {
+        Some(c) => c,
+        None => {
+            return Json(RegisterSignalResponse {
+                success: false,
+                message: String::new(),
+                error: Some("No pending registration. Call POST /register-signal first.".into()),
+            });
+        }
+    };
 
-    println!();
-    println!("Registration complete!");
-    println!("Account: {}", registered.registration_data().service_ids);
-    println!("Phone: {}", registered.registration_data().phone_number);
-    println!();
-    println!("Restart the daemon normally (without --register).");
+    // Downcast to the actual confirmation manager type
+    type ConfManager = presage::Manager<presage_store_sqlite::SqliteStore, presage::manager::Confirmation>;
+    let conf_manager = match confirmation.downcast::<ConfManager>() {
+        Ok(m) => *m,
+        Err(_) => {
+            return Json(RegisterSignalResponse {
+                success: false,
+                message: String::new(),
+                error: Some("Internal error: confirmation manager type mismatch.".into()),
+            });
+        }
+    };
 
-    Ok(())
+    tracing::info!("Confirming verification code...");
+
+    match conf_manager.confirm_verification_code(req.code.trim().to_string()).await {
+        Ok(registered_manager) => {
+            let reg = registered_manager.registration_data();
+            let phone = reg.phone_number.to_string();
+            let uuid = reg.service_ids.aci.to_string();
+            tracing::info!("Registration complete! {} ({})", phone, uuid);
+
+            let mut s = state.lock().await;
+            s.mode = DaemonMode::Normal;
+            s.phone_number = phone.clone();
+            s.uuid = uuid.clone();
+
+            // Signal the receiver thread to start
+            if let Some(tx) = s.registration_complete_tx.take() {
+                let _ = tx.send(());
+            }
+
+            Json(RegisterSignalResponse {
+                success: true,
+                message: format!("Registered as {phone} ({uuid}). Now set a username via POST /set-username."),
+                error: None,
+            })
+        }
+        Err(e) => {
+            tracing::error!("Verification failed: {e:#}");
+            Json(RegisterSignalResponse {
+                success: false,
+                message: String::new(),
+                error: Some(format!("Verification failed: {e}")),
+            })
+        }
+    }
+}
+
+/// POST /set-username — Claim a Signal username (e.g. "apicharge_kx7m").
+/// Signal assigns the discriminator (e.g. ".42"). Returns the full username.
+///
+/// This calls Signal's reserve + confirm API using the `usernames` crate for
+/// hash computation and ZK proof generation.
+async fn handle_set_username(
+    State(state): State<SharedState>,
+    Json(req): Json<SetUsernameRequest>,
+) -> Json<SetUsernameResponse> {
+    use presage::model::identity::OnNewIdentity;
+    use usernames::{Username, NicknameLimits};
+
+    // Validate nickname
+    let nickname = req.nickname.trim();
+    if nickname.is_empty() || nickname.len() > 32 {
+        return Json(SetUsernameResponse {
+            success: false,
+            username: None,
+            error: Some("Nickname must be 1-32 characters.".into()),
+        });
+    }
+
+    let db_path = {
+        let s = state.lock().await;
+        s.db_path.clone()
+    };
+
+    // Load registered manager
+    let store = match presage_store_sqlite::SqliteStore::open_with_passphrase(
+        &db_path, None, OnNewIdentity::Trust,
+    ).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some(format!("Failed to open store: {e}")),
+            });
+        }
+    };
+
+    let manager = match presage::Manager::load_registered(store).await {
+        Ok(m) => m,
+        Err(e) => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some(format!("No registered identity: {e}")),
+            });
+        }
+    };
+
+    // Generate candidates using the usernames crate
+    let limits = NicknameLimits::default();
+    let mut rng = rand::rngs::OsRng;
+    let candidates = match Username::candidates_from(&mut rng, nickname, limits) {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some(format!("Invalid nickname: {e:?}")),
+            });
+        }
+    };
+
+    tracing::info!("Generated {} username candidates for '{}'", candidates.len(), nickname);
+
+    // Compute hashes for all candidates
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    let mut candidate_map: std::collections::HashMap<[u8; 32], String> = std::collections::HashMap::new();
+    for candidate in &candidates {
+        match Username::new(candidate) {
+            Ok(u) => {
+                let hash = u.hash();
+                hashes.push(hash);
+                candidate_map.insert(hash, candidate.clone());
+            }
+            Err(e) => tracing::warn!("Skipping invalid candidate '{}': {e:?}", candidate),
+        }
+    }
+
+    if hashes.is_empty() {
+        return Json(SetUsernameResponse {
+            success: false, username: None,
+            error: Some("No valid candidates generated.".into()),
+        });
+    }
+
+    // Reserve: PUT /v1/accounts/username_hash/reserve
+    let hashes_b64: Vec<String> = hashes.iter()
+        .map(|h| base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, h))
+        .collect();
+
+    let reserve_body = serde_json::json!({ "usernameHashes": hashes_b64 });
+
+    // Use the manager's authenticated WebSocket to make the HTTP request
+    // For now, use direct HTTP since presage doesn't expose reserve/confirm yet
+    let reg = manager.registration_data();
+    let credentials = format!("{}:{}", reg.service_ids.aci, reg.password());
+    let auth_header = format!("Basic {}", base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD, credentials.as_bytes()));
+
+    let signal_host = std::env::var("SIGNAL_HOST").unwrap_or_else(|_| "chat.signal.org".into());
+    let http_client = reqwest::Client::new();
+
+    let reserve_url = format!("https://{signal_host}/v1/accounts/username_hash/reserve");
+    tracing::info!("Reserving username at {reserve_url}...");
+
+    let reserve_resp = match http_client.put(&reserve_url)
+        .header("Authorization", &auth_header)
+        .json(&reserve_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some(format!("Reserve request failed: {e}")),
+            });
+        }
+    };
+
+    if !reserve_resp.status().is_success() {
+        let status = reserve_resp.status();
+        let body = reserve_resp.text().await.unwrap_or_default();
+        return Json(SetUsernameResponse {
+            success: false, username: None,
+            error: Some(format!("Reserve failed (HTTP {status}): {body}")),
+        });
+    }
+
+    let reserve_result: serde_json::Value = match reserve_resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some(format!("Failed to parse reserve response: {e}")),
+            });
+        }
+    };
+
+    let selected_hash_b64 = match reserve_result["usernameHash"].as_str() {
+        Some(h) => h.to_string(),
+        None => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some("Reserve response missing usernameHash.".into()),
+            });
+        }
+    };
+
+    let selected_hash_bytes: [u8; 32] = match base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD, &selected_hash_b64
+    ) {
+        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
+        _ => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some("Invalid hash in reserve response.".into()),
+            });
+        }
+    };
+
+    // Find which candidate was selected
+    let selected_username = match candidate_map.get(&selected_hash_bytes) {
+        Some(u) => u.clone(),
+        None => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some("Reserved hash doesn't match any candidate.".into()),
+            });
+        }
+    };
+
+    tracing::info!("Reserved username: {selected_username}");
+
+    // Generate ZK proof
+    let username_obj = Username::new(&selected_username).unwrap();
+    let mut randomness = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rng, &mut randomness);
+    let proof = match username_obj.proof(&randomness) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some(format!("Failed to generate ZK proof: {e:?}")),
+            });
+        }
+    };
+
+    // Confirm: PUT /v1/accounts/username_hash/confirm
+    let confirm_body = serde_json::json!({
+        "usernameHash": selected_hash_b64,
+        "zkProof": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &proof),
+    });
+
+    let confirm_url = format!("https://{signal_host}/v1/accounts/username_hash/confirm");
+    tracing::info!("Confirming username...");
+
+    let confirm_resp = match http_client.put(&confirm_url)
+        .header("Authorization", &auth_header)
+        .json(&confirm_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(SetUsernameResponse {
+                success: false, username: None,
+                error: Some(format!("Confirm request failed: {e}")),
+            });
+        }
+    };
+
+    if !confirm_resp.status().is_success() {
+        let status = confirm_resp.status();
+        let body = confirm_resp.text().await.unwrap_or_default();
+        return Json(SetUsernameResponse {
+            success: false, username: None,
+            error: Some(format!("Confirm failed (HTTP {status}): {body}")),
+        });
+    }
+
+    tracing::info!("Username confirmed: {selected_username}");
+
+    // Store username in state
+    {
+        let mut s = state.lock().await;
+        s.username = Some(selected_username.clone());
+    }
+
+    Json(SetUsernameResponse {
+        success: true,
+        username: Some(selected_username),
+        error: None,
+    })
 }

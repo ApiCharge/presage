@@ -160,6 +160,56 @@ pub struct TeeSignResponse {
     pub signature_hex: String,
 }
 
+// ── Registration Mode API ────────────────────────────────────────
+
+/// Response for GET /status (extended with mode + username)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExtendedStatusResponse {
+    pub connected: bool,
+    pub mode: String,           // "registration" or "normal"
+    pub phone_number: String,
+    pub uuid: String,
+    pub username: Option<String>,
+    pub messages_received: u64,
+}
+
+/// Request for POST /register-signal (step 1: initiate registration)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterSignalRequest {
+    pub phone_number: String,   // E.164 format, e.g. "+420702843097"
+    pub captcha: String,        // signalcaptcha:// token from https://signalcaptchas.org/registration/generate.html
+}
+
+/// Response for POST /register-signal
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterSignalResponse {
+    pub success: bool,
+    pub message: String,
+    pub error: Option<String>,
+}
+
+/// Request for POST /register-signal/verify (step 2: submit SMS code)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VerifyCodeRequest {
+    pub code: String,           // 6-digit SMS verification code
+}
+
+/// Request for POST /set-username
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetUsernameRequest {
+    /// Desired nickname prefix (e.g. "apicharge_kx7m"). The discriminator (.NN) is assigned by Signal.
+    pub nickname: String,
+}
+
+/// Response for POST /set-username
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetUsernameResponse {
+    pub success: bool,
+    /// Full username including discriminator (e.g. "apicharge_kx7m.42")
+    pub username: Option<String>,
+    pub error: Option<String>,
+}
+
 /// A detected SenderKeyDistributionMessage event.
 /// The daemon surfaces these so the relay can trigger TEE attestation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

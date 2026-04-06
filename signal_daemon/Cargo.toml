@@ -40,3 +40,9 @@ ctr = "0.9"
 # Ed25519 signing for TEE attestation
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+
+# Signal username crypto (hash + ZK proof generation)
+usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.87.4" }
+
+# HTTP client for Signal server API (username reserve/confirm)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

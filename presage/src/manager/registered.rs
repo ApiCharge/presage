@@ -962,49 +962,12 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Reserve a username with Signal's servers.
     /// Submits up to 20 username hashes; Signal returns the first available one.
-    /// Returns the hash that was reserved (base64url-encoded).
     pub async fn reserve_username(
         &mut self,
         username_hashes: Vec<Vec<u8>>,
     ) -> Result<Vec<u8>, Error<S::Error>> {
-        use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-        use base64::Engine;
-
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ReserveRequest {
-            username_hashes: Vec<String>,
-        }
-
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ReserveResponse {
-            username_hash: String,
-        }
-
-        let body = ReserveRequest {
-            username_hashes: username_hashes
-                .iter()
-                .map(|h| BASE64_URL_SAFE_NO_PAD.encode(h))
-                .collect(),
-        };
-
         let mut ws = self.identified_websocket(false).await?;
-        let response: ReserveResponse = ws
-            .http_request(reqwest::Method::PUT, "/v1/accounts/username_hash/reserve")?
-            .send_json(&body)
-            .await?
-            .service_error_for_status()
-            .await?
-            .json()
-            .await?;
-
-        let hash = BASE64_URL_SAFE_NO_PAD
-            .decode(&response.username_hash)
-            .map_err(|_| Error::ServiceError(libsignal_service::prelude::ServiceError::InvalidFrame {
-                reason: "invalid base64 in username hash response",
-            }))?;
-        Ok(hash)
+        Ok(ws.reserve_username(&username_hashes).await?)
     }
 
     /// Confirm a previously reserved username with a zero-knowledge proof.
@@ -1013,29 +976,8 @@ impl<S: Store> Manager<S, Registered> {
         username_hash: &[u8],
         zk_proof: &[u8],
     ) -> Result<(), Error<S::Error>> {
-        use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-        use base64::Engine;
-
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ConfirmRequest {
-            username_hash: String,
-            zk_proof: String,
-        }
-
-        let body = ConfirmRequest {
-            username_hash: BASE64_URL_SAFE_NO_PAD.encode(username_hash),
-            zk_proof: BASE64_URL_SAFE_NO_PAD.encode(zk_proof),
-        };
-
         let mut ws = self.identified_websocket(false).await?;
-        ws.http_request(reqwest::Method::PUT, "/v1/accounts/username_hash/confirm")?
-            .send_json(&body)
-            .await?
-            .service_error_for_status()
-            .await?;
-
-        Ok(())
+        Ok(ws.confirm_username(username_hash, zk_proof).await?)
     }
 
     /// Sends a messages to the provided [ServiceId].

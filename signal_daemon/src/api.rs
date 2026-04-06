@@ -194,22 +194,6 @@ pub struct VerifyCodeRequest {
     pub code: String,           // 6-digit SMS verification code
 }
 
-/// Request for POST /set-username
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SetUsernameRequest {
-    /// Desired nickname prefix (e.g. "apicharge_kx7m"). The discriminator (.NN) is assigned by Signal.
-    pub nickname: String,
-}
-
-/// Response for POST /set-username
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SetUsernameResponse {
-    pub success: bool,
-    /// Full username including discriminator (e.g. "apicharge_kx7m.42")
-    pub username: Option<String>,
-    pub error: Option<String>,
-}
-
 /// A detected SenderKeyDistributionMessage event.
 /// The daemon surfaces these so the relay can trigger TEE attestation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

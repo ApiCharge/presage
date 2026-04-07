@@ -1825,7 +1825,7 @@ impl<S: Store> Manager<S, Registered> {
             .fetch_encrypted_group(&mut rand::rng(), &master_key_bytes)
             .await
         {
-            Ok(fetched_encrypted_group) => {
+            Ok((fetched_encrypted_group, _endorsements)) => {
                 let group = decrypt_group(&master_key_bytes, fetched_encrypted_group)?;
                 debug!(group_title = %group.title, members = group.members.len(), "fetched created group");
                 if let Err(e) = self.store.save_group(master_key_bytes, group).await {
@@ -2105,7 +2105,7 @@ async fn upsert_group<S: Store>(
             .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
             .await
         {
-            Ok(encrypted_group) => {
+            Ok((encrypted_group, _endorsements)) => {
                 let group = decrypt_group(master_key_bytes, encrypted_group)?;
                 if let Err(error) = store.save_group(master_key_bytes.try_into()?, group).await {
                     error!(%error, "failed to save group");

@@ -158,9 +158,11 @@ async fn handle_content(
 
     if is_group {
         tracing::info!(
-            "Group message from {}: {}",
+            "Group message from {}: {} [skm_bytes={}, skm_seed={}]",
             sender_uuid,
             body.as_deref().unwrap_or("<non-text>"),
+            sender_key_msg.as_ref().map(|b| b.len()).unwrap_or(0),
+            sender_key_seed.as_ref().map(|b| b.len()).unwrap_or(0),
         );
     } else {
         tracing::info!(

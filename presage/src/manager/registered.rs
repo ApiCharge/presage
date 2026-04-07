@@ -886,12 +886,13 @@ impl<S: Store> Manager<S, Registered> {
                                     let mk = libsignal_protocol::LAST_MESSAGE_KEY.with(|cell| cell.borrow_mut().take());
                                     let _ = libsignal_protocol::LAST_PQR_SALT.with(|cell| cell.borrow_mut().take());
                                     let skdm_signing_key = libsignal_protocol::LAST_SKDM_SIGNING_KEY.with(|cell| cell.borrow_mut().take());
-                                    tracing::info!("[DIAG] open_envelope Ok(None): raw={} mk={} skdm_key={}", raw_content.is_some(), mk.is_some(), skdm_signing_key.is_some());
+                                    let skdm_sender = libsignal_service::cipher::LAST_SKDM_SENDER.with(|cell| cell.borrow_mut().take());
+                                    tracing::info!("[DIAG] open_envelope Ok(None): raw={} mk={} skdm_key={} sender={:?}", raw_content.is_some(), mk.is_some(), skdm_signing_key.is_some(), skdm_sender);
                                     if raw_content.is_some() && mk.is_some() {
                                         debug!("SKDM detected (envelope decrypted but content filtered), signing_key={}", skdm_signing_key.as_ref().map(hex::encode).unwrap_or_default());
                                         return Some((Received::SenderKeyDistribution {
                                             raw_content: raw_content.clone(),
-                                            sender: String::new(), // sender unknown from Ok(None)
+                                            sender: skdm_sender.unwrap_or_default(),
                                             signing_key: skdm_signing_key,
                                             skdm_bytes: None,
                                         }, state));

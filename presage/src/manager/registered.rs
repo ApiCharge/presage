@@ -872,7 +872,10 @@ impl<S: Store> Manager<S, Registered> {
                                     // Capture message key from libsignal's decryption (set during open_envelope)
                                     let message_key = libsignal_protocol::LAST_MESSAGE_KEY.with(|cell| cell.borrow_mut().take());
                                     let pqr_salt = libsignal_protocol::LAST_PQR_SALT.with(|cell| cell.borrow_mut().take());
-                                    return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), message_key, pqr_salt }, state));
+                                    // Capture SenderKey raw bytes + seed (set during group_decrypt)
+                                    let sender_key_msg = libsignal_protocol::LAST_SKM_BYTES.with(|cell| cell.borrow_mut().take());
+                                    let sender_key_seed = libsignal_protocol::LAST_SKM_SEED.with(|cell| cell.borrow_mut().take());
+                                    return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), message_key, pqr_salt, sender_key_msg, sender_key_seed }, state));
                                 }
                                 Ok(None) => {
                                     // open_envelope returns None for SKDMs (processed internally)

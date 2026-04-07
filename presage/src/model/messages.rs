@@ -32,6 +32,12 @@ pub enum Received {
         /// PQR (post-quantum ratchet) salt for HKDF expansion of message_key.
         /// None if PQR is not active (use zero salt).
         pqr_salt: Option<Vec<u8>>,
+        /// Raw SenderKeyMessage wire bytes (version + protobuf + 64-byte signature).
+        /// Set only for group messages decrypted via SenderKey protocol.
+        sender_key_msg: Option<Vec<u8>>,
+        /// SenderMessageKey seed (32 bytes) — HKDF("WhisperGroup") input for on-chain decryption.
+        /// Set only for group messages decrypted via SenderKey protocol.
+        sender_key_seed: Option<Vec<u8>>,
     },
 
     /// A SenderKeyDistributionMessage was received and processed.

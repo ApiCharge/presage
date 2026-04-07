@@ -49,6 +49,15 @@ pub struct ReceivedMessage {
     /// UUID of the member who joined (if is_member_joined is true)
     #[serde(default)]
     pub joined_member_uuid: Option<String>,
+
+    /// Raw SenderKeyMessage wire bytes (hex). For group messages only.
+    /// Contains version + protobuf(chain_id, iteration, ciphertext) + 64-byte signature.
+    /// Used by the contract for on-chain signature verification + decryption.
+    pub sender_key_msg: Option<String>,
+
+    /// SenderMessageKey seed (hex, 32 bytes). For group messages only.
+    /// Input to HKDF("WhisperGroup") → iv(16) + cipher_key(32) for on-chain decryption.
+    pub sender_key_seed: Option<String>,
 }
 
 /// The fields needed by the Soroban contract's SealedEnvelope.

@@ -1605,66 +1605,7 @@ impl<S: Store> Manager<S, Registered> {
         let server_public_params = service_configuration.zkgroup_server_public_params;
 
         // 3a. Ensure profile is uploaded (required for credential issuance)
-        debug!("create_group: uploading versioned profile to ensure credential availability");
-        {
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD;
-
-            let profile_key_version = our_profile_key.get_profile_key_version(our_aci);
-            let version = bincode::serialize(&profile_key_version)
-                .map_err(|e| {
-                    error!("failed to serialize profile key version: {e}");
-                    libsignal_service::prelude::ServiceError::GroupsV2Error
-                })?;
-            let version_str = std::str::from_utf8(&version)
-                .expect("hex encoded profile key version");
-            let commitment = our_profile_key.get_commitment(our_aci);
-            let commitment_bytes = bincode::serialize(&commitment)
-                .map_err(|e| {
-                    error!("failed to serialize profile key commitment: {e}");
-                    libsignal_service::prelude::ServiceError::GroupsV2Error
-                })?;
-
-            // Encrypt a minimal profile name
-            let profile_cipher = libsignal_service::profile_cipher::ProfileCipher::new(our_profile_key);
-            let profile_name = libsignal_service::profile_name::ProfileName { given_name: "ApiCharge Relay", family_name: None };
-            let encrypted_name = profile_cipher.encrypt_name(&profile_name, &mut rand::rng())
-                .map_err(|_| libsignal_service::prelude::ServiceError::GroupsV2Error)?;
-            let name_b64 = b64.encode(&encrypted_name);
-
-            let push_service = self.identified_push_service();
-            let profile_payload = serde_json::json!({
-                "version": version_str,
-                "name": name_b64,
-                "aboutEmoji": null,
-                "about": null,
-                "paymentAddress": null,
-                "avatar": false,
-                "commitment": b64.encode(&commitment_bytes),
-            });
-
-            let response = push_service
-                .request(
-                    Method::PUT,
-                    Endpoint::service("/v1/profile"),
-                    HttpAuthOverride::NoOverride,
-                )?
-                .header("Content-Type", "application/json")
-                .body(serde_json::to_vec(&profile_payload).unwrap())
-                .send()
-                .await
-                .map_err(|e| {
-                    error!("failed to upload profile: {e}");
-                    Error::ServiceError(e.into())
-                })?;
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                error!(status_code = %status.as_u16(), body = %body, "profile upload failed");
-            } else {
-                debug!("create_group: profile uploaded successfully");
-            }
-        }
+        self.ensure_profile_uploaded("ApiCharge Relay").await?;
 
         // 3b. Obtain ExpiringProfileKeyCredentialPresentation for the creator
         debug!("create_group: obtaining credential presentation for creator");
@@ -1891,6 +1832,237 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         Ok(master_key_bytes)
+    }
+
+    /// Ensures a versioned profile is uploaded to Signal's server.
+    ///
+    /// This is required before generating profile key credentials for group operations.
+    /// The profile contains an encrypted name, profile key version, and commitment.
+    async fn ensure_profile_uploaded(
+        &self,
+        display_name: &str,
+    ) -> Result<(), Error<S::Error>> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let our_aci: Aci = self.state.data.service_ids.aci();
+        let our_profile_key: ProfileKey = self.state.data.profile_key;
+
+        let profile_key_version = our_profile_key.get_profile_key_version(our_aci);
+        let version = bincode::serialize(&profile_key_version)
+            .map_err(|e| {
+                error!("failed to serialize profile key version: {e}");
+                libsignal_service::prelude::ServiceError::GroupsV2Error
+            })?;
+        let version_str = std::str::from_utf8(&version)
+            .expect("hex encoded profile key version");
+        let commitment = our_profile_key.get_commitment(our_aci);
+        let commitment_bytes = bincode::serialize(&commitment)
+            .map_err(|e| {
+                error!("failed to serialize profile key commitment: {e}");
+                libsignal_service::prelude::ServiceError::GroupsV2Error
+            })?;
+
+        // Encrypt a minimal profile name
+        let profile_cipher = libsignal_service::profile_cipher::ProfileCipher::new(our_profile_key);
+        let profile_name = libsignal_service::profile_name::ProfileName {
+            given_name: display_name,
+            family_name: None,
+        };
+        let encrypted_name = profile_cipher.encrypt_name(&profile_name, &mut rand::rng())
+            .map_err(|_| libsignal_service::prelude::ServiceError::GroupsV2Error)?;
+        let name_b64 = b64.encode(&encrypted_name);
+
+        let push_service = self.identified_push_service();
+        let profile_payload = serde_json::json!({
+            "version": version_str,
+            "name": name_b64,
+            "aboutEmoji": null,
+            "about": null,
+            "paymentAddress": null,
+            "avatar": false,
+            "commitment": b64.encode(&commitment_bytes),
+        });
+
+        let response = push_service
+            .request(
+                Method::PUT,
+                Endpoint::service("/v1/profile"),
+                HttpAuthOverride::NoOverride,
+            )?
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_vec(&profile_payload).unwrap())
+            .send()
+            .await
+            .map_err(|e| {
+                error!("failed to upload profile: {e}");
+                Error::ServiceError(e.into())
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            error!(status_code = %status.as_u16(), body = %body, "profile upload failed");
+        } else {
+            debug!("profile uploaded successfully");
+        }
+
+        Ok(())
+    }
+
+    /// Accepts a pending group invite by promoting self from pending to full member.
+    ///
+    /// When `create_group()` adds members, they are added as PENDING (no profile key,
+    /// no credential presentation). For Signal clients to count a member as SenderKey-capable,
+    /// the member must be a FULL member. This method:
+    ///
+    /// 1. Derives group secret params from the master key
+    /// 2. Fetches the current group state (to get the revision)
+    /// 3. Generates a credential presentation proving our identity
+    /// 4. Submits a `PromotePendingMemberAction` GroupChange to promote self to full member
+    pub async fn accept_group_invite(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+    ) -> Result<(), Error<S::Error>> {
+        let group_master_key = GroupMasterKey::new(*master_key_bytes);
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(group_master_key);
+
+        // 1. Get group auth credentials
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let authorization = groups_manager
+            .get_authorization_for_today(&mut rand::rng(), group_secret_params)
+            .await
+            .map_err(|e| {
+                error!("accept_group_invite: failed to get authorization: {e:#}");
+                e
+            })?;
+
+        // 2. Fetch current group to get revision
+        let encrypted_group = groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await
+            .map_err(|e| {
+                error!("accept_group_invite: failed to fetch group: {e:#}");
+                e
+            })?;
+        let revision = encrypted_group.revision;
+        info!("accept_group_invite: current group revision = {}", revision);
+
+        // 3. Ensure our profile is uploaded (required for credential issuance)
+        self.ensure_profile_uploaded("ApiCharge Companion").await?;
+
+        // 4. Generate our credential presentation for this group
+        let our_aci: Aci = self.state.data.service_ids.aci();
+        let our_profile_key: ProfileKey = self.state.data.profile_key;
+        let service_configuration = self.state.service_configuration();
+        let server_public_params = service_configuration.zkgroup_server_public_params;
+
+        let presentation = self
+            .get_expiring_profile_key_credential_presentation(
+                our_aci,
+                our_profile_key,
+                &server_public_params,
+                group_secret_params,
+            )
+            .await
+            .map_err(|e| {
+                error!("accept_group_invite: failed to get credential presentation: {e:#}");
+                e
+            })?;
+        let presentation_bytes = libsignal_service::zkgroup::serialize(&presentation);
+        debug!(
+            "accept_group_invite: got credential presentation ({} bytes)",
+            presentation_bytes.len()
+        );
+
+        // 5. Build PromotePendingMemberAction
+        let promote_action =
+            libsignal_service::proto::group_change::actions::PromotePendingMemberAction {
+                presentation: presentation_bytes,
+                ..Default::default()
+            };
+
+        // 6. Build GroupChange.Actions
+        let encrypted_source =
+            bincode::serialize(&group_secret_params.encrypt_service_id(our_aci.into()))
+                .map_err(|e| {
+                    error!("failed to serialize encrypted source id: {e}");
+                    libsignal_service::prelude::ServiceError::GroupsV2Error
+                })?;
+
+        let actions = libsignal_service::proto::group_change::Actions {
+            source_service_id: encrypted_source,
+            revision: revision + 1,
+            promote_pending_members: vec![promote_action],
+            ..Default::default()
+        };
+
+        // 7. Serialize Actions, wrap in GroupChange, and submit
+        let mut actions_bytes = Vec::new();
+        actions.encode(&mut actions_bytes)
+            .map_err(|_| libsignal_service::prelude::ServiceError::GroupsV2Error)?;
+
+        let group_change = libsignal_service::proto::GroupChange {
+            actions: actions_bytes,
+            server_signature: vec![],
+            change_epoch: 6, // current GV2 epoch
+        };
+
+        let mut body_bytes = Vec::new();
+        group_change.encode(&mut body_bytes)
+            .map_err(|_| libsignal_service::prelude::ServiceError::GroupsV2Error)?;
+
+        let push_service = self.identified_push_service();
+        let response = push_service
+            .request(
+                Method::PATCH,
+                Endpoint::storage("/v1/groups/"),
+                HttpAuthOverride::Identified(authorization),
+            )?
+            .header("Content-Type", "application/x-protobuf")
+            .body(body_bytes)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("accept_group_invite: failed to submit group change: {e}");
+                Error::ServiceError(e.into())
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            error!(
+                status_code = %status.as_u16(),
+                body = %body_text,
+                "accept_group_invite: group change rejected by server"
+            );
+            return Err(libsignal_service::prelude::ServiceError::GroupsV2Error.into());
+        }
+
+        info!("accept_group_invite: successfully promoted to full member (revision {})", revision + 1);
+
+        // 8. Fetch and store the updated group locally
+        match groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await
+        {
+            Ok(fetched) => {
+                let group = decrypt_group(master_key_bytes, fetched)?;
+                debug!(
+                    "accept_group_invite: group '{}' now has {} members",
+                    group.title,
+                    group.members.len()
+                );
+                if let Err(e) = self.store.save_group(*master_key_bytes, group).await {
+                    error!("failed to save updated group locally: {e}");
+                }
+            }
+            Err(e) => {
+                warn!("failed to fetch back updated group: {e}");
+            }
+        }
+
+        Ok(())
     }
 
     /// Fetches an `ExpiringProfileKeyCredentialPresentation` for the given ACI.

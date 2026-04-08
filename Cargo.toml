@@ -8,8 +8,10 @@ quickcheck_async = { git = 'https://github.com/nytopop/quickcheck_async', rev = 
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = '2a42b3354c9194700d08aa070f70a131a470e7dc' }
 
 # ApiCharge fork of libsignal-service-rs — adds reserve_username/confirm_username
+# Temporarily using local path for registration REST fix. Push to ApiCharge fork
+# and revert to git rev when done.
 [patch."https://github.com/whisperfish/libsignal-service-rs.git"]
-libsignal-service = { git = "https://github.com/ApiCharge/libsignal-service-rs.git", rev = "c777ee9" }
+libsignal-service = { path = "../libsignal-service-rs" }
 
 # ApiCharge fork of libsignal — adds LAST_MESSAGE_KEY thread-local for sealed sender relay
 # All crates from the monorepo must be patched to avoid dual-version conflicts

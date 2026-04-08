@@ -4,15 +4,16 @@ use libsignal_service::configuration::SignalServers;
 use libsignal_service::messagepipe::ServiceCredentials;
 use libsignal_service::prelude::phonenumber::PhoneNumber;
 use libsignal_service::prelude::PushService;
-use libsignal_service::protocol::IdentityKeyPair;
+use libsignal_service::protocol::{IdentityKeyPair, IdentityKeyStore};
 use libsignal_service::provisioning::generate_registration_id;
 use libsignal_service::push_service::ServiceIds;
 use libsignal_service::utils::TryIntoE164;
 use libsignal_service::websocket::account::{AccountAttributes, DeviceCapabilities};
-use libsignal_service::websocket::registration::{RegistrationMethod, VerifyAccountResponse};
+use libsignal_service::websocket::registration::{
+    DeviceActivationRequest, RegistrationMethod, VerifyAccountResponse,
+};
 use libsignal_service::zkgroup::profiles::ProfileKey;
-use libsignal_service::AccountManager;
-use rand::RngCore;
+use rand::{CryptoRng, RngCore};
 use tracing::trace;
 
 use crate::manager::registered::RegistrationData;
@@ -64,17 +65,16 @@ impl<S: Store> Manager<S, Confirmation> {
             device_id: None,
         };
 
-        let mut identified_push_service = PushService::new(
+        let identified_push_service = PushService::new(
             *signal_servers,
-            Some(credentials.clone()),
+            Some(credentials),
             crate::USER_AGENT,
         );
 
-        let mut identified_websocket = identified_push_service
-            .ws("/v1/websocket/", "/v1/keepalive", &[], Some(credentials))
-            .await?;
-
-        let session = identified_websocket
+        // Submit verification code via direct REST (not WebSocket).
+        // Signal's /v1/websocket/ rejects credentials for unregistered accounts.
+        // See: https://github.com/whisperfish/presage/issues/371
+        let session = identified_push_service
             .submit_verification_code(session_id, confirmation_code.as_ref())
             .await?;
 
@@ -93,7 +93,7 @@ impl<S: Store> Manager<S, Confirmation> {
         rng.fill_bytes(&mut profile_key);
         let profile_key = ProfileKey::generate(profile_key);
 
-        // generate new identity keys used in `register_account` and below
+        // generate new identity keys
         self.store
             .set_aci_identity_key_pair(IdentityKeyPair::generate(&mut rng))
             .await?;
@@ -101,38 +101,83 @@ impl<S: Store> Manager<S, Confirmation> {
             .set_pni_identity_key_pair(IdentityKeyPair::generate(&mut rng))
             .await?;
 
-        let skip_device_transfer = true;
-        let mut account_manager = AccountManager::new(
-            identified_push_service,
-            identified_websocket,
-            Some(profile_key),
-        );
+        // Generate pre-keys (mirrors AccountManager::register_account)
+        let aci_identity_key_pair = self.store.aci_protocol_store()
+            .get_identity_key_pair().await?;
+        let pni_identity_key_pair = self.store.pni_protocol_store()
+            .get_identity_key_pair().await?;
 
+        let (
+            _aci_pre_keys,
+            aci_signed_pre_key,
+            _aci_kyber_pre_keys,
+            aci_last_resort_kyber_prekey,
+        ) = libsignal_service::pre_keys::replenish_pre_keys(
+            &mut self.store.aci_protocol_store(),
+            &mut rng,
+            &aci_identity_key_pair,
+            true,
+            0,
+            0,
+        )
+        .await?;
+
+        let (
+            _pni_pre_keys,
+            pni_signed_pre_key,
+            _pni_kyber_pre_keys,
+            pni_last_resort_kyber_prekey,
+        ) = libsignal_service::pre_keys::replenish_pre_keys(
+            &mut self.store.pni_protocol_store(),
+            &mut rng,
+            &pni_identity_key_pair,
+            true,
+            0,
+            0,
+        )
+        .await?;
+
+        let device_activation_request = DeviceActivationRequest {
+            aci_signed_pre_key: aci_signed_pre_key.try_into()?,
+            pni_signed_pre_key: pni_signed_pre_key.try_into()?,
+            aci_pq_last_resort_pre_key: aci_last_resort_kyber_prekey
+                .expect("requested last resort prekey")
+                .try_into()?,
+            pni_pq_last_resort_pre_key: pni_last_resort_kyber_prekey
+                .expect("requested last resort prekey")
+                .try_into()?,
+        };
+
+        let account_attributes = AccountAttributes {
+            fetches_messages: true,
+            registration_id,
+            pni_registration_id,
+            name: None,
+            registration_lock: None,
+            unidentified_access_key: Some(
+                profile_key.derive_access_key().to_vec(),
+            ),
+            unrestricted_unidentified_access: false,
+            capabilities: DeviceCapabilities::default(),
+            discoverable_by_phone_number: true,
+            pin: None,
+            recovery_password: None,
+        };
+
+        // Register via direct REST (not WebSocket).
         let VerifyAccountResponse {
             aci,
             pni,
             storage_capable: _,
             number: _,
-        } = account_manager
-            .register_account(
-                &mut rng,
+        } = identified_push_service
+            .submit_registration_request(
                 RegistrationMethod::SessionId(&session.id),
-                AccountAttributes {
-                    fetches_messages: true,
-                    registration_id,
-                    pni_registration_id,
-                    name: None,
-                    registration_lock: None,
-                    unidentified_access_key: Some(profile_key.derive_access_key().to_vec()),
-                    unrestricted_unidentified_access: true,
-                    capabilities: DeviceCapabilities::default(),
-                    discoverable_by_phone_number: true,
-                    pin: None,
-                    recovery_password: None,
-                },
-                &mut self.store.aci_protocol_store(),
-                &mut self.store.pni_protocol_store(),
-                skip_device_transfer,
+                account_attributes,
+                true, // skip_device_transfer
+                aci_identity_key_pair.identity_key(),
+                pni_identity_key_pair.identity_key(),
+                device_activation_request,
             )
             .await?;
 

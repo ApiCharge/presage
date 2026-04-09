@@ -34,6 +34,13 @@ pub struct AppState {
     pub username: Option<String>,
     pub db_path: String,
     pub registration_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Queue of group master keys to accept invites for (pushed by HTTP, consumed by receiver)
+    pub invite_accept_queue: Vec<PendingInviteAccept>,
+}
+
+pub struct PendingInviteAccept {
+    pub master_key_hex: String,
+    pub response_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -88,6 +95,7 @@ async fn async_main() -> anyhow::Result<()> {
         } else {
             None
         },
+        invite_accept_queue: Vec::new(),
     }));
 
     if initial_mode == DaemonMode::Normal {
@@ -119,11 +127,12 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
-    // HTTP server — minimal: status + registration only
+    // HTTP server — minimal: status, registration, and invite acceptance
     let app = Router::new()
         .route("/register-signal", post(handle_register_signal))
         .route("/register-signal/verify", post(handle_verify_code))
         .route("/status", get(handle_status))
+        .route("/accept-invite", post(handle_accept_invite))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -181,7 +190,7 @@ fn start_receiver_thread(state: SharedState, db_path: String) {
                 }
 
                 loop {
-                    match run_companion_receive_loop(&mut manager).await {
+                    match run_companion_receive_loop(&mut manager, state.clone()).await {
                         Ok(()) => tracing::info!("Companion receiver ended, reconnecting in 10s..."),
                         Err(e) => tracing::error!("Companion receiver error: {e:#}, reconnecting in 10s..."),
                     }
@@ -192,9 +201,10 @@ fn start_receiver_thread(state: SharedState, db_path: String) {
         .expect("failed to spawn companion receiver thread");
 }
 
-/// Minimal receive loop: auto-accept group invites, ignore everything else.
+/// Minimal receive loop: auto-accept group invites, process accept-invite queue.
 async fn run_companion_receive_loop(
     manager: &mut presage::Manager<presage_store_sqlite::SqliteStore, presage::manager::Registered>,
+    state: SharedState,
 ) -> anyhow::Result<()> {
     use futures::StreamExt;
     use presage::model::messages::Received;
@@ -204,7 +214,49 @@ async fn run_companion_receive_loop(
 
     tracing::info!("Companion receive loop started");
 
-    while let Some(item) = stream.next().await {
+    loop {
+        // Drain the invite accept queue before waiting for messages
+        {
+            let pending: Vec<PendingInviteAccept> = {
+                let mut s = state.lock().await;
+                std::mem::take(&mut s.invite_accept_queue)
+            };
+            for item in pending {
+                tracing::info!("Processing queued invite accept: {}...", &item.master_key_hex[..16.min(item.master_key_hex.len())]);
+                match hex::decode(&item.master_key_hex) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut master_key = [0u8; 32];
+                        master_key.copy_from_slice(&bytes);
+                        match manager.accept_group_invite(&master_key).await {
+                            Ok(()) => {
+                                tracing::info!("Accepted group invite via HTTP");
+                                let _ = item.response_tx.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let err = format!("{e:#}");
+                                tracing::error!("Failed to accept invite: {err}");
+                                let _ = item.response_tx.send(Err(err));
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = item.response_tx.send(Err("Invalid master_key_hex".into()));
+                    }
+                }
+            }
+        }
+
+        // Wait for next message with timeout (so we periodically check the queue)
+        let item = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.next(),
+        ).await {
+            Ok(Some(item)) => item,
+            Ok(None) => break, // stream ended
+            Err(_) => continue, // timeout — loop back to check queue
+        };
+
+        match item {
         match item {
             Received::Content { content, .. } => {
                 // Check for group invite: DataMessage with GroupContextV2 containing master_key
@@ -381,6 +433,17 @@ struct VerifyCodeRequest {
     code: String,
 }
 
+#[derive(Deserialize)]
+struct AcceptInviteRequest {
+    master_key_hex: String,
+}
+
+#[derive(Serialize)]
+struct AcceptInviteResponse {
+    success: bool,
+    error: Option<String>,
+}
+
 // ── HTTP Handlers ────────────────────────────────────────────────
 
 async fn handle_status(State(state): State<SharedState>) -> Json<StatusResponse> {
@@ -394,6 +457,37 @@ async fn handle_status(State(state): State<SharedState>) -> Json<StatusResponse>
         uuid: s.uuid.clone(),
         username: s.username.clone(),
     })
+}
+
+/// Accept a group invite by master key. The relay calls this after creating a group
+/// with the companion as a pending member.
+async fn handle_accept_invite(
+    State(state): State<SharedState>,
+    Json(req): Json<AcceptInviteRequest>,
+) -> Json<AcceptInviteResponse> {
+    tracing::info!("accept-invite called for master_key={}...", &req.master_key_hex[..16.min(req.master_key_hex.len())]);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut s = state.lock().await;
+        if s.mode != DaemonMode::Normal {
+            return Json(AcceptInviteResponse {
+                success: false,
+                error: Some("Companion not in normal mode".into()),
+            });
+        }
+        s.invite_accept_queue.push(PendingInviteAccept {
+            master_key_hex: req.master_key_hex,
+            response_tx: tx,
+        });
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(Ok(()))) => Json(AcceptInviteResponse { success: true, error: None }),
+        Ok(Ok(Err(e))) => Json(AcceptInviteResponse { success: false, error: Some(e) }),
+        Ok(Err(_)) => Json(AcceptInviteResponse { success: false, error: Some("Internal error".into()) }),
+        Err(_) => Json(AcceptInviteResponse { success: false, error: Some("Timeout".into()) }),
+    }
 }
 
 async fn handle_register_signal(

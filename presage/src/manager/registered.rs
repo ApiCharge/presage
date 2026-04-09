@@ -1909,6 +1909,58 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Checks if we are a pending member of a group, and if so, accepts the invite.
+    /// Returns Ok(true) if accepted, Ok(false) if not pending, Err on failure.
+    pub async fn check_pending_and_accept(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+    ) -> Result<bool, Error<S::Error>> {
+        let group_master_key = GroupMasterKey::new(*master_key_bytes);
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(group_master_key);
+
+        // Fetch the encrypted group state to check pending members
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let encrypted_group = groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await?;
+
+        // Check if our ACI is in pending_members (ACI invite path)
+        // Use zkgroup serialization directly — NOT bincode, which adds framing bytes
+        let our_aci: Aci = self.state.data.service_ids.aci();
+        let our_aci_ciphertext = group_secret_params.encrypt_service_id(our_aci.into());
+        let our_aci_bytes = libsignal_service::zkgroup::serialize(&our_aci_ciphertext);
+
+        let is_aci_pending = encrypted_group.pending_members.iter().any(|pm| {
+            pm.member
+                .as_ref()
+                .map(|m| m.user_id.as_slice() == our_aci_bytes.as_slice())
+                .unwrap_or(false)
+        });
+
+        if is_aci_pending {
+            info!("check_pending_and_accept: confirmed as ACI pending member, accepting...");
+            self.accept_group_invite(master_key_bytes).await?;
+            return Ok(true);
+        }
+
+        // Check if we're already a full member
+        let is_full_member = encrypted_group.members.iter().any(|m| {
+            m.user_id.as_slice() == our_aci_bytes.as_slice()
+        });
+
+        if is_full_member {
+            info!("check_pending_and_accept: already a full member of this group");
+        } else {
+            // Not pending via ACI, not a full member — log for diagnostics
+            info!("check_pending_and_accept: not found in pending or full members (pending_members={}, members={})",
+                encrypted_group.pending_members.len(),
+                encrypted_group.members.len());
+        }
+
+        Ok(false)
+    }
+
     /// Accepts a pending group invite by promoting self from pending to full member.
     ///
     /// When `create_group()` adds members, they are added as PENDING (no profile key,
@@ -1957,6 +2009,7 @@ impl<S: Store> Manager<S, Registered> {
         let service_configuration = self.state.service_configuration();
         let server_public_params = service_configuration.zkgroup_server_public_params;
 
+        info!("accept_group_invite: fetching credential for ACI={:?}, profile_key_len={}", our_aci, our_profile_key.get_bytes().len());
         let presentation = self
             .get_expiring_profile_key_credential_presentation(
                 our_aci,
@@ -1967,6 +2020,7 @@ impl<S: Store> Manager<S, Registered> {
             .await
             .map_err(|e| {
                 error!("accept_group_invite: failed to get credential presentation: {e:#}");
+                error!("accept_group_invite: this may indicate an expired ExpiringProfileKeyCredential — check if the companion has refreshed its profile recently");
                 e
             })?;
         let presentation_bytes = libsignal_service::zkgroup::serialize(&presentation);

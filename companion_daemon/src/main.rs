@@ -227,17 +227,31 @@ async fn run_companion_receive_loop(
                     Ok(bytes) if bytes.len() == 32 => {
                         let mut master_key = [0u8; 32];
                         master_key.copy_from_slice(&bytes);
-                        match manager.accept_group_invite(&master_key).await {
-                            Ok(()) => {
-                                tracing::info!("Accepted group invite via HTTP");
-                                let _ = item.response_tx.send(Ok(()));
-                            }
-                            Err(e) => {
-                                let err = format!("{e:#}");
-                                tracing::error!("Failed to accept invite: {err}");
-                                let _ = item.response_tx.send(Err(err));
+
+                        // Check if we're actually a pending member before accepting.
+                        // Retry with backoff — the group state may not have propagated yet.
+                        let delays = [2u64, 5, 10];
+                        let mut result: Result<(), String> = Err("Not a pending member after 3 retries".into());
+                        for (attempt, delay) in delays.iter().enumerate() {
+                            match manager.check_pending_and_accept(&master_key).await {
+                                Ok(true) => {
+                                    tracing::info!("Accepted group invite (attempt {})", attempt + 1);
+                                    result = Ok(());
+                                    break;
+                                }
+                                Ok(false) => {
+                                    tracing::info!("Not pending yet (attempt {}), retrying in {}s...", attempt + 1, delay);
+                                    tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                                }
+                                Err(e) => {
+                                    let err = format!("{e:#}");
+                                    tracing::error!("Failed to accept invite (attempt {}): {err}", attempt + 1);
+                                    result = Err(err);
+                                    break;
+                                }
                             }
                         }
+                        let _ = item.response_tx.send(result);
                     }
                     _ => {
                         let _ = item.response_tx.send(Err("Invalid master_key_hex".into()));

@@ -2038,11 +2038,9 @@ impl<S: Store> Manager<S, Registered> {
 
         // 6. Build GroupChange.Actions
         let encrypted_source =
-            bincode::serialize(&group_secret_params.encrypt_service_id(our_aci.into()))
-                .map_err(|e| {
-                    error!("failed to serialize encrypted source id: {e}");
-                    libsignal_service::prelude::ServiceError::GroupsV2Error
-                })?;
+            libsignal_service::zkgroup::serialize(
+                &group_secret_params.encrypt_service_id(our_aci.into())
+            );
 
         let actions = libsignal_service::proto::group_change::Actions {
             source_service_id: encrypted_source,

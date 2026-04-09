@@ -1624,13 +1624,9 @@ impl<S: Store> Manager<S, Registered> {
         debug!("create_group: got credential presentation ({} bytes)", libsignal_service::zkgroup::serialize(&presentation).len());
         let presentation_bytes = libsignal_service::zkgroup::serialize(&presentation);
 
-        // Encrypt the group public key (bincode-serialized GroupPublicParams)
+        // Encrypt the group public key
         let group_public_params = group_secret_params.get_public_params();
-        let public_key = bincode::serialize(&group_public_params)
-            .map_err(|e| {
-                error!("failed to serialize group public params: {e}");
-                libsignal_service::prelude::ServiceError::GroupsV2Error
-            })?;
+        let public_key = libsignal_service::zkgroup::serialize(&group_public_params);
 
         // Encrypt the title as a GroupAttributeBlob
         let title_blob = libsignal_service::proto::GroupAttributeBlob {
@@ -1651,17 +1647,11 @@ impl<S: Store> Manager<S, Registered> {
 
         // Encrypt our own member entry (with valid credential presentation)
         let encrypted_user_id =
-            bincode::serialize(&group_secret_params.encrypt_service_id(our_aci.into()))
-                .map_err(|e| {
-                    error!("failed to serialize encrypted user id: {e}");
-                    libsignal_service::prelude::ServiceError::GroupsV2Error
-                })?;
+            libsignal_service::zkgroup::serialize(
+                &group_secret_params.encrypt_service_id(our_aci.into()));
         let encrypted_profile_key =
-            bincode::serialize(&group_secret_params.encrypt_profile_key(our_profile_key, our_aci))
-                .map_err(|e| {
-                    error!("failed to serialize encrypted profile key: {e}");
-                    libsignal_service::prelude::ServiceError::GroupsV2Error
-                })?;
+            libsignal_service::zkgroup::serialize(
+                &group_secret_params.encrypt_profile_key(our_profile_key, our_aci));
 
         let creator_member = libsignal_service::proto::Member {
             user_id: encrypted_user_id,
@@ -1674,19 +1664,13 @@ impl<S: Store> Manager<S, Registered> {
         // Build pending members for invited ACIs
         let mut pending_members = Vec::new();
         let encrypted_creator_id =
-            bincode::serialize(&group_secret_params.encrypt_service_id(our_aci.into()))
-                .map_err(|e| {
-                    error!("failed to serialize creator id for pending member: {e}");
-                    libsignal_service::prelude::ServiceError::GroupsV2Error
-                })?;
+            libsignal_service::zkgroup::serialize(
+                &group_secret_params.encrypt_service_id(our_aci.into()));
 
         for member_aci in &member_acis {
             let encrypted_member_id =
-                bincode::serialize(&group_secret_params.encrypt_service_id((*member_aci).into()))
-                    .map_err(|e| {
-                        error!("failed to serialize encrypted member id: {e}");
-                        libsignal_service::prelude::ServiceError::GroupsV2Error
-                    })?;
+                libsignal_service::zkgroup::serialize(
+                    &group_secret_params.encrypt_service_id((*member_aci).into()));
 
             let pending_member = libsignal_service::proto::PendingMember {
                 member: Some(libsignal_service::proto::Member {
@@ -1849,19 +1833,10 @@ impl<S: Store> Manager<S, Registered> {
         let our_profile_key: ProfileKey = self.state.data.profile_key;
 
         let profile_key_version = our_profile_key.get_profile_key_version(our_aci);
-        let version = bincode::serialize(&profile_key_version)
-            .map_err(|e| {
-                error!("failed to serialize profile key version: {e}");
-                libsignal_service::prelude::ServiceError::GroupsV2Error
-            })?;
-        let version_str = std::str::from_utf8(&version)
-            .expect("hex encoded profile key version");
+        let version_bytes = libsignal_service::zkgroup::serialize(&profile_key_version);
+        let version_str = hex::encode(&version_bytes);
         let commitment = our_profile_key.get_commitment(our_aci);
-        let commitment_bytes = bincode::serialize(&commitment)
-            .map_err(|e| {
-                error!("failed to serialize profile key commitment: {e}");
-                libsignal_service::prelude::ServiceError::GroupsV2Error
-            })?;
+        let commitment_bytes = libsignal_service::zkgroup::serialize(&commitment);
 
         // Encrypt a minimal profile name
         let profile_cipher = libsignal_service::profile_cipher::ProfileCipher::new(our_profile_key);
@@ -2148,14 +2123,9 @@ impl<S: Store> Manager<S, Registered> {
         let request = request_context.get_request();
 
         // Step 2: Build the profile endpoint URL with credential request
-        let profile_key_version =
-            bincode::serialize(&profile_key.get_profile_key_version(aci))
-                .map_err(|e| {
-                    error!("failed to serialize profile key version: {e}");
-                    libsignal_service::prelude::ServiceError::GroupsV2Error
-                })?;
-        let version_str = std::str::from_utf8(&profile_key_version)
-            .expect("profile key version is hex encoded");
+        let profile_key_version = profile_key.get_profile_key_version(aci);
+        let version_bytes = libsignal_service::zkgroup::serialize(&profile_key_version);
+        let version_str = hex::encode(&version_bytes);
 
         let credential_request_bytes = libsignal_service::zkgroup::serialize(&request);
         let credential_request_hex = hex::encode(&credential_request_bytes);

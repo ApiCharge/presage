@@ -1834,7 +1834,7 @@ impl<S: Store> Manager<S, Registered> {
 
         let profile_key_version = our_profile_key.get_profile_key_version(our_aci);
         let version_bytes = libsignal_service::zkgroup::serialize(&profile_key_version);
-        let version_str = hex::encode(&version_bytes);
+        let version_str = String::from_utf8(version_bytes).expect("profile key version is hex-encoded UTF-8");
         let commitment = our_profile_key.get_commitment(our_aci);
         let commitment_bytes = libsignal_service::zkgroup::serialize(&commitment);
 
@@ -2029,15 +2029,8 @@ impl<S: Store> Manager<S, Registered> {
         actions.encode(&mut actions_bytes)
             .map_err(|_| libsignal_service::prelude::ServiceError::GroupsV2Error)?;
 
-        let group_change = libsignal_service::proto::GroupChange {
-            actions: actions_bytes,
-            server_signature: vec![],
-            change_epoch: 6, // current GV2 epoch
-        };
-
-        let mut body_bytes = Vec::new();
-        group_change.encode(&mut body_bytes)
-            .map_err(|_| libsignal_service::prelude::ServiceError::GroupsV2Error)?;
+        // Send raw Actions protobuf directly — the server wraps it in GroupChange after signing
+        let body_bytes = actions_bytes;
 
         let push_service = self.identified_push_service();
         let response = push_service
@@ -2125,7 +2118,7 @@ impl<S: Store> Manager<S, Registered> {
         // Step 2: Build the profile endpoint URL with credential request
         let profile_key_version = profile_key.get_profile_key_version(aci);
         let version_bytes = libsignal_service::zkgroup::serialize(&profile_key_version);
-        let version_str = hex::encode(&version_bytes);
+        let version_str = String::from_utf8(version_bytes).expect("profile key version is hex-encoded UTF-8");
 
         let credential_request_bytes = libsignal_service::zkgroup::serialize(&request);
         let credential_request_hex = hex::encode(&credential_request_bytes);

@@ -875,8 +875,9 @@ impl<S: Store> Manager<S, Registered> {
                                     // Capture SenderKey raw bytes + seed (set during group_decrypt)
                                     let sender_key_msg = libsignal_protocol::LAST_SKM_BYTES.with(|cell| cell.borrow_mut().take());
                                     let sender_key_seed = libsignal_protocol::LAST_SKM_SEED.with(|cell| cell.borrow_mut().take());
+                                    let sender_key_signing_key = libsignal_protocol::LAST_SKM_SIGNING_KEY.with(|cell| cell.borrow_mut().take());
                                     tracing::debug!("[DIAG] open_envelope Ok(Some): mk={} skm={} seed={}", message_key.is_some(), sender_key_msg.is_some(), sender_key_seed.is_some());
-                                    return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), message_key, pqr_salt, sender_key_msg, sender_key_seed }, state));
+                                    return Some((Received::Content { content: Box::new(content), raw_content: raw_content.clone(), message_key, pqr_salt, sender_key_msg, sender_key_seed, sender_key_signing_key }, state));
                                 }
                                 Ok(None) => {
                                     // open_envelope returns None for SKDMs (processed internally)

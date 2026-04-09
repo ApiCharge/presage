@@ -58,6 +58,11 @@ pub struct ReceivedMessage {
     /// SenderMessageKey seed (hex, 32 bytes). For group messages only.
     /// Input to HKDF("WhisperGroup") → iv(16) + cipher_key(32) for on-chain decryption.
     pub sender_key_seed: Option<String>,
+
+    /// Signing key (hex, 32 bytes, Curve25519 no prefix) used to verify the SenderKeyMessage.
+    /// May differ from the SKDM signing key if the sender rotated after a membership change.
+    /// The relay compares this to the on-chain key and re-registers if different.
+    pub sender_key_signing_key: Option<String>,
 }
 
 /// The fields needed by the Soroban contract's SealedEnvelope.

@@ -38,6 +38,10 @@ pub enum Received {
         /// SenderMessageKey seed (32 bytes) — HKDF("WhisperGroup") input for on-chain decryption.
         /// Set only for group messages decrypted via SenderKey protocol.
         sender_key_seed: Option<Vec<u8>>,
+        /// Signing key (32 bytes, Curve25519 no prefix) used to verify the SenderKeyMessage.
+        /// May differ from the SKDM signing key if the sender rotated after a membership change.
+        /// The relay compares this to the on-chain key and re-registers if different.
+        sender_key_signing_key: Option<Vec<u8>>,
     },
 
     /// A SenderKeyDistributionMessage was received and processed.

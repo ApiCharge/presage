@@ -272,20 +272,19 @@ async fn run_companion_receive_loop(
 
         match item {
             Received::Content { content, .. } => {
-                // Check for group invite: DataMessage with GroupContextV2 containing master_key
+                // Only attempt to accept if we detect a genuine invite (GroupContextV2 with master_key).
+                // Use check_pending_and_accept to verify we're actually pending before trying.
                 if let ContentBody::DataMessage(ref dm) = content.body {
                     if let Some(ref gv2) = dm.group_v2 {
                         if let Some(ref mk) = gv2.master_key {
                             if mk.len() == 32 {
                                 let mut master_key = [0u8; 32];
                                 master_key.copy_from_slice(mk);
-                                tracing::info!(
-                                    "Companion: received group invite (master_key={}...)",
-                                    hex::encode(&master_key[..8])
-                                );
-                                match manager.accept_group_invite(&master_key).await {
-                                    Ok(()) => tracing::info!("Companion: accepted group invite"),
-                                    Err(e) => tracing::error!("Companion: failed to accept invite: {e:#}"),
+                                // Only log + attempt if we haven't already joined this group
+                                match manager.check_pending_and_accept(&master_key).await {
+                                    Ok(true) => tracing::info!("Companion: accepted group invite (master_key={}...)", hex::encode(&master_key[..8])),
+                                    Ok(false) => {} // Already a member or not pending — silently ignore
+                                    Err(e) => tracing::error!("Companion: failed to check/accept invite: {e:#}"),
                                 }
                             }
                         }

@@ -52,8 +52,8 @@ pub async fn run_receive_loop(
 
             item = stream.next() => {
                 match item {
-                    Some(Received::Content { content, sender_key_msg, sender_key_seed, .. }) => {
-                        handle_content(*content, sender_key_msg, sender_key_seed, &app_state).await;
+                    Some(Received::Content { content, sender_key_msg, sender_key_seed, sender_key_signing_key, .. }) => {
+                        handle_content(*content, sender_key_msg, sender_key_seed, sender_key_signing_key, &app_state).await;
                     }
                     Some(Received::SenderKeyDistribution { sender, signing_key, .. }) => {
                         let key_hex = signing_key.as_ref().map(hex::encode).unwrap_or_default();
@@ -93,6 +93,7 @@ pub async fn run_receive_loop(
                                 joined_member_uuid: None,
                                 sender_key_msg: None,
                                 sender_key_seed: None,
+                                sender_key_signing_key: None,
                             };
 
                             let mut s = app_state.lock().await;
@@ -120,6 +121,7 @@ async fn handle_content(
     content: Content,
     sender_key_msg: Option<Vec<u8>>,
     sender_key_seed: Option<Vec<u8>>,
+    sender_key_signing_key: Option<Vec<u8>>,
     app_state: &Arc<Mutex<crate::AppState>>,
 ) {
     let sender_uuid = content.metadata.sender.raw_uuid().to_string();
@@ -189,6 +191,7 @@ async fn handle_content(
             joined_member_uuid: None,
             sender_key_msg: sender_key_msg.as_ref().map(hex::encode),
             sender_key_seed: sender_key_seed.as_ref().map(hex::encode),
+            sender_key_signing_key: sender_key_signing_key.as_ref().map(hex::encode),
         };
 
         // Sign the message with the TEE key.

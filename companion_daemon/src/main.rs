@@ -257,7 +257,6 @@ async fn run_companion_receive_loop(
         };
 
         match item {
-        match item {
             Received::Content { content, .. } => {
                 // Check for group invite: DataMessage with GroupContextV2 containing master_key
                 if let ContentBody::DataMessage(ref dm) = content.body {
@@ -288,7 +287,7 @@ async fn run_companion_receive_loop(
             Received::QueueEmpty => {}
             Received::Contacts => {}
         }
-    }
+    } // loop
 
     Ok(())
 }

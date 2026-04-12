@@ -73,9 +73,9 @@ pub struct AppState {
     pub uuid: String,
     pub username: Option<String>,
     pub tee_signing_key: SigningKey,
-    /// Group IDs the daemon has seen (populated from incoming messages + group creates).
-    /// Used by /list-groups for fee change notifications.
-    pub known_group_ids: std::collections::HashSet<String>,
+    /// Group IDs → member UUIDs (populated from presage store at boot + group creates).
+    /// Used by /list-groups for migration and notification routing.
+    pub known_groups: std::collections::HashMap<String, Vec<String>>,
     /// Presage DB path (needed for registration flow)
     pub db_path: String,
     /// Signal to the receiver thread that registration completed and it should start
@@ -143,7 +143,7 @@ async fn async_main() -> anyhow::Result<()> {
         uuid: String::new(),
         username: persisted_username.clone(),
         tee_signing_key,
-        known_group_ids: std::collections::HashSet::new(),
+        known_groups: std::collections::HashMap::new(),
         db_path: db_path.clone(),
         registration_complete_tx: if initial_mode == DaemonMode::Registration {
             Some(reg_complete_tx)
@@ -367,13 +367,18 @@ fn start_receiver_thread(state: SharedState, db_path: String) {
                     s.uuid = reg.service_ids.aci.to_string();
                     tracing::info!("Connected as {} ({})", s.phone_number, s.uuid);
 
-                    // Load all known groups from presage store into the cache
+                    // Load all known groups with members from presage store
                     match manager.store().groups().await {
                         Ok(groups_iter) => {
                             let mut count = 0;
                             for group_result in groups_iter {
-                                if let Ok((master_key, _group)) = group_result {
-                                    s.known_group_ids.insert(hex::encode(master_key));
+                                if let Ok((master_key, group)) = group_result {
+                                    let members: Vec<String> = group
+                                        .members
+                                        .iter()
+                                        .map(|m| m.aci.service_id_string())
+                                        .collect();
+                                    s.known_groups.insert(hex::encode(master_key), members);
                                     count += 1;
                                 }
                             }
@@ -532,8 +537,15 @@ async fn handle_typing(
 
 async fn handle_list_groups(State(state): State<SharedState>) -> Json<ListGroupsResponse> {
     let s = state.lock().await;
-    let group_ids: Vec<String> = s.known_group_ids.iter().cloned().collect();
-    Json(ListGroupsResponse { group_ids })
+    let groups: Vec<GroupInfo> = s
+        .known_groups
+        .iter()
+        .map(|(group_id, members)| GroupInfo {
+            group_id: group_id.clone(),
+            members: members.clone(),
+        })
+        .collect();
+    Json(ListGroupsResponse { groups })
 }
 
 async fn handle_tee_sign(

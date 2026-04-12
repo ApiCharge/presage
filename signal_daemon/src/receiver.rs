@@ -210,10 +210,7 @@ async fn handle_content(
         }
 
         let mut s = app_state.lock().await;
-        // Track group ID for /list-groups (persistent across session)
-        if let Some(ref gid) = msg.group_id {
-            s.known_group_ids.insert(gid.clone());
-        }
+        // known_groups is populated at boot from store + on group create only
         s.message_queue.push(msg);
         s.messages_received += 1;
     }
@@ -329,10 +326,10 @@ async fn process_pending_group_creates(
             Ok(master_key_bytes) => {
                 let group_id = hex::encode(master_key_bytes);
                 tracing::info!("Group '{}' created, id={}", create.name, group_id);
-                // Track in known groups cache
+                // Track in known groups cache with members
                 {
                     let mut s = app_state.lock().await;
-                    s.known_group_ids.insert(group_id.clone());
+                    s.known_groups.insert(group_id.clone(), create.members.clone());
                 }
                 let _ = create.response_tx.send(Ok(group_id));
             }

@@ -156,10 +156,17 @@ pub struct TeePubkeyResponse {
     pub pubkey_hex: String,
 }
 
+/// Group info with members for /list-groups
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GroupInfo {
+    pub group_id: String,
+    pub members: Vec<String>,
+}
+
 /// Response for GET /list-groups
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListGroupsResponse {
-    pub group_ids: Vec<String>,
+    pub groups: Vec<GroupInfo>,
 }
 
 /// Request for POST /tee-sign

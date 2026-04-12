@@ -55,12 +55,11 @@ pub async fn run_receive_loop(
                     Some(Received::Content { content, sender_key_msg, sender_key_seed, sender_key_signing_key, .. }) => {
                         handle_content(*content, sender_key_msg, sender_key_seed, sender_key_signing_key, &app_state).await;
                     }
-                    Some(Received::SenderKeyDistribution { sender, signing_key, .. }) => {
+                    Some(Received::SenderKeyDistribution { sender, signing_key, group_id, .. }) => {
                         let key_hex = signing_key.as_ref().map(hex::encode).unwrap_or_default();
-                        tracing::info!("SenderKeyDistribution from {sender}, signing_key={key_hex}");
+                        tracing::info!("SenderKeyDistribution from {sender}, signing_key={key_hex}, group={group_id:?}");
 
                         if let Some(sk) = signing_key {
-                            // Queue SKDM event for the relay with TEE signature
                             let sender_uuid = if sender.is_empty() { "unknown".to_string() } else { sender };
                             let sk_hex = hex::encode(&sk);
 
@@ -86,7 +85,7 @@ pub async fn run_receive_loop(
                                 verified_envelope: None,
                                 tee_signature: Some(tee_sig),
                                 decrypted_body: None,
-                                group_id: None,
+                                group_id,
                                 is_skdm: true,
                                 skdm_signing_key: Some(sk_hex),
                                 is_member_joined: false,

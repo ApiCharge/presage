@@ -56,5 +56,7 @@ pub enum Received {
         signing_key: Option<Vec<u8>>,
         /// The raw SenderKeyDistributionMessage protobuf bytes
         skdm_bytes: Option<Vec<u8>>,
+        /// Group master key (hex) — SKDMs are always group-specific
+        group_id: Option<String>,
     },
 }

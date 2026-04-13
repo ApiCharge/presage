@@ -55,13 +55,36 @@ pub async fn run_receive_loop(
                     Some(Received::Content { content, sender_key_msg, sender_key_seed, sender_key_signing_key, .. }) => {
                         handle_content(*content, sender_key_msg, sender_key_seed, sender_key_signing_key, &app_state).await;
                     }
-                    Some(Received::SenderKeyDistribution { sender, signing_key, group_id, .. }) => {
+                    Some(Received::SenderKeyDistribution { sender, signing_key, group_id, distribution_id, .. }) => {
                         let key_hex = signing_key.as_ref().map(hex::encode).unwrap_or_default();
-                        tracing::info!("SenderKeyDistribution from {sender}, signing_key={key_hex}, group={group_id:?}");
+                        tracing::info!("SenderKeyDistribution from {sender}, signing_key={key_hex}, group={group_id:?}, dist={distribution_id:?}");
 
                         if let Some(sk) = signing_key {
-                            let sender_uuid = if sender.is_empty() { "unknown".to_string() } else { sender };
+                            let sender_uuid = if sender.is_empty() { "unknown".to_string() } else { sender.clone() };
                             let sk_hex = hex::encode(&sk);
+
+                            // Resolve group_id: prefer DataMessage.group_v2.master_key,
+                            // fall back to finding the sender in known_groups
+                            let resolved_group_id = if group_id.is_some() {
+                                group_id
+                            } else {
+                                let s = app_state.lock().await;
+                                let sender_uuid_ref = &sender;
+                                let matching: Vec<_> = s.known_groups.iter()
+                                    .filter(|(_, members)| members.contains(sender_uuid_ref))
+                                    .map(|(gid, _)| gid.clone())
+                                    .collect();
+                                if matching.len() == 1 {
+                                    tracing::info!("Resolved SKDM group from known_groups: {}", matching[0]);
+                                    Some(matching[0].clone())
+                                } else if matching.len() > 1 {
+                                    tracing::warn!("SKDM sender {} is in {} groups, cannot disambiguate", sender_uuid_ref, matching.len());
+                                    None
+                                } else {
+                                    tracing::warn!("SKDM sender {} not found in any known group", sender_uuid_ref);
+                                    None
+                                }
+                            };
 
                             // Sign: sender_uuid || signing_key
                             let mut sign_data = Vec::new();
@@ -85,7 +108,7 @@ pub async fn run_receive_loop(
                                 verified_envelope: None,
                                 tee_signature: Some(tee_sig),
                                 decrypted_body: None,
-                                group_id,
+                                group_id: resolved_group_id,
                                 is_skdm: true,
                                 skdm_signing_key: Some(sk_hex),
                                 is_member_joined: false,

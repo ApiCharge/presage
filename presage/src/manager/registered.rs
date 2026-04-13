@@ -889,7 +889,8 @@ impl<S: Store> Manager<S, Registered> {
                                     let skdm_signing_key = libsignal_protocol::LAST_SKDM_SIGNING_KEY.with(|cell| cell.borrow_mut().take());
                                     let skdm_sender = libsignal_service::cipher::LAST_SKDM_SENDER.with(|cell: &std::cell::RefCell<Option<String>>| cell.borrow_mut().take());
                                     let skdm_group_id = libsignal_service::cipher::LAST_SKDM_GROUP_ID.with(|cell: &std::cell::RefCell<Option<String>>| cell.borrow_mut().take());
-                                    tracing::debug!("[DIAG] open_envelope Ok(None): raw={} mk={} skdm_key={} sender={:?} group={:?}", raw_content.is_some(), mk.is_some(), skdm_signing_key.is_some(), skdm_sender, skdm_group_id);
+                                    let skdm_distribution_id = libsignal_service::cipher::LAST_SKDM_DISTRIBUTION_ID.with(|cell: &std::cell::RefCell<Option<String>>| cell.borrow_mut().take());
+                                    tracing::debug!("[DIAG] open_envelope Ok(None): raw={} mk={} skdm_key={} sender={:?} group={:?} dist={:?}", raw_content.is_some(), mk.is_some(), skdm_signing_key.is_some(), skdm_sender, skdm_group_id, skdm_distribution_id);
                                     if raw_content.is_some() && mk.is_some() {
                                         debug!("SKDM detected (envelope decrypted but content filtered), signing_key={}, group={:?}", skdm_signing_key.as_ref().map(hex::encode).unwrap_or_default(), skdm_group_id);
                                         return Some((Received::SenderKeyDistribution {
@@ -898,6 +899,7 @@ impl<S: Store> Manager<S, Registered> {
                                             signing_key: skdm_signing_key,
                                             skdm_bytes: None,
                                             group_id: skdm_group_id,
+                                            distribution_id: skdm_distribution_id,
                                         }, state));
                                     } else {
                                         debug!("empty envelope, message will be skipped!")

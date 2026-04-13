@@ -58,5 +58,8 @@ pub enum Received {
         skdm_bytes: Option<Vec<u8>>,
         /// Group master key (hex) — SKDMs are always group-specific
         group_id: Option<String>,
+        /// Distribution ID (UUID string) from the SKDM protobuf.
+        /// Used to resolve group context when group_id is None.
+        distribution_id: Option<String>,
     },
 }

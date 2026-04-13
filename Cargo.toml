@@ -10,7 +10,7 @@ libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rus
 # ApiCharge fork of libsignal-service-rs — adds reserve_username/confirm_username
 # ApiCharge fork of libsignal-service-rs — adds reserve_username/confirm_username + REST registration
 [patch."https://github.com/whisperfish/libsignal-service-rs.git"]
-libsignal-service = { git = "https://github.com/ApiCharge/libsignal-service-rs.git", rev = "792f951" }
+libsignal-service = { git = "https://github.com/ApiCharge/libsignal-service-rs.git", rev = "1ff7bd2" }
 
 # ApiCharge fork of libsignal — adds LAST_MESSAGE_KEY thread-local for sealed sender relay
 # All crates from the monorepo must be patched to avoid dual-version conflicts
